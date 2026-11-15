@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  crm-3d-serving:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crm_3d_engine
+    ports:
+      - "8000:8000"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PORT=8000
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./static/generated_3d:/app/static/generated_3d
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

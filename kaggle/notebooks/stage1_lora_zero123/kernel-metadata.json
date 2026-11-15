@@ -1,0 +1,13 @@
+{
+  "id": "KAGGLE_USERNAME/crm-3d-stage1",
+  "title": "CRM 3D - Stage 1 LoRA Zero123++ Fine-tune",
+  "code_file": "train_stage1.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}

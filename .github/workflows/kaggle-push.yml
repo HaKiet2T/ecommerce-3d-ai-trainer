@@ -1,0 +1,51 @@
+name: Push CRM Training to Kaggle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'kaggle/notebooks/**'
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Training stage to push'
+        required: true
+        type: choice
+        options:
+          - data_prep
+          - stage1
+          - stage2
+
+jobs:
+  push-to-kaggle:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Push to Kaggle
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          STAGE="${{ github.event.inputs.stage || 'stage2' }}"
+          echo "Pushing stage: $STAGE"
+          python kaggle/push_training.py --stage $STAGE --action push
+
+      - name: Check initial status
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          STAGE="${{ github.event.inputs.stage || 'stage2' }}"
+          sleep 10
+          python kaggle/push_training.py --stage $STAGE --action status
