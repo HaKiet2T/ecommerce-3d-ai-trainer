@@ -42,15 +42,9 @@ def install_dependencies():
         "lpips",
         "trimesh",
         "huggingface_hub",
-        "pytorch3d"  # Có thể cần build from source
     ]
     for pkg in packages:
         os.system(f"pip install -q {pkg}")
-
-    # PyTorch3D cần build riêng trên Kaggle
-    os.system(
-        "pip install -q 'git+https://github.com/facebookresearch/pytorch3d.git@stable'"
-    )
 
 print("[1/7] Installing dependencies...")
 install_dependencies()
@@ -94,22 +88,22 @@ from diffusers import DiffusionPipeline, DDIMScheduler
 # ---------------------------------------------------------------------------
 
 class TrainConfig:
-    # Model
+    # Model (High-Precision Configuration)
     model_name = "sudo-ai/zero123plus-v1.2"
-    lora_rank = 16
-    lora_alpha = 32
+    lora_rank = 32       # Tăng rank lên 32 để học chi tiết sắc nét của gear và ghế công thái học
+    lora_alpha = 64      # Tỉ lệ scaling alpha = 2 * rank chuẩn hóa
     lora_target_modules = [
-        "to_q", "to_k", "to_v", "to_out.0",  # attention
-        "conv1", "conv2",  # resnet blocks
+        "to_q", "to_k", "to_v", "to_out.0",  # Attention modules
+        "conv1", "conv2",                    # ResNet convolutional blocks
     ]
 
-    # Training
-    batch_size = 1  # T4 16GB - conservative
-    gradient_accumulation_steps = 4  # effective batch = 4
-    learning_rate = 1e-4
+    # Training (Được tối ưu cho độ chính xác cao nhất)
+    batch_size = 1  # T4 16GB
+    gradient_accumulation_steps = 8  # Effective batch = 8 giúp ước lượng gradient ổn định
+    learning_rate = 8e-5             # LR tinh chỉnh phù hợp cho rank 32
     weight_decay = 0.01
-    num_train_steps = 5000
-    warmup_steps = 500
+    num_train_steps = 8000           # Mở rộng lên 8000 steps đảm bảo hội tụ sâu
+    warmup_steps = 800               # Khởi động làm ấm 10% tổng số steps
     save_every = 1000
     log_every = 50
 

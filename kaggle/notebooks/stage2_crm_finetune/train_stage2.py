@@ -51,11 +51,6 @@ def install_dependencies():
     for pkg in packages:
         os.system(f"pip install -q {pkg}")
 
-    # PyTorch3D
-    os.system(
-        "pip install -q 'git+https://github.com/facebookresearch/pytorch3d.git@stable'"
-    )
-
 print("[1/8] Installing dependencies...")
 install_dependencies()
 
@@ -99,22 +94,22 @@ class TrainConfig:
     mlp_hidden_dim = 64
     sdf_threshold = 0.0
 
-    # Training
+    # Training (Được tối ưu cho độ chính xác cao nhất)
     batch_size = 2  # 1 per T4 GPU with DataParallel
-    gradient_accumulation_steps = 4
+    gradient_accumulation_steps = 4  # Effective batch = 8
     learning_rate = 5e-5
     weight_decay = 0.01
-    num_train_steps = 3000
-    warmup_steps = 300
-    save_every = 500
-    eval_every = 500
-    log_every = 25
+    num_train_steps = 8000  # Mở rộng lên 8000 steps để mạng Triplane hội tụ chi tiết cao
+    warmup_steps = 800
+    save_every = 1000
+    eval_every = 1000
+    log_every = 50
 
-    # Loss weights
+    # Loss weights (Gia tăng trọng số bảo toàn hình học và chuẩn hóa bề mặt)
     lambda_rgb = 1.0       # RGB reconstruction loss
     lambda_lpips = 0.5     # Perceptual loss
-    lambda_sdf = 0.1       # SDF regularization
-    lambda_eikonal = 0.01  # Eikonal (gradient norm) loss
+    lambda_sdf = 0.2       # SDF surface loss (tăng gấp đôi để phạt sai lệch bề mặt)
+    lambda_eikonal = 0.05  # Eikonal (gradient norm) loss tăng từ 0.01 lên 0.05 triệt tiêu màng mờ và ripple
 
     # Data
     image_size = 256
@@ -632,7 +627,7 @@ def train(config):
         log("[4/8] Downloading CRM checkpoint from HuggingFace...")
         ckpt_path = hf_hub_download(
             repo_id=config.crm_checkpoint,
-            filename="ccm-diffusion.pth",
+            filename="CRM.pth",
             token=HF_TOKEN
         )
         state_dict = torch.load(ckpt_path, map_location="cpu")
@@ -853,7 +848,56 @@ def validate(model, val_loader, criterion, config, log):
 
     avg_val_loss = sum(val_losses) / max(len(val_losses), 1)
     log(f"  [VAL] Loss: {avg_val_loss:.4f} ({len(val_losses)} batches)")
+
+    # Trích xuất 1 sample mesh để kiểm định
+    try:
+        val_batch = next(iter(val_loader))
+        sample_views = val_batch["views"][:1].to(config.device)
+        sample_ccms = val_batch["ccms"][:1].to(config.device)
+        out_mesh_path = Path(config.mesh_output_dir) / f"val_mesh_sample.obj"
+        if extract_mesh_sample(model, sample_views, sample_ccms, out_mesh_path, resolution=64, device=config.device):
+            log(f"  [VAL] Extracted sample 3D mesh: {out_mesh_path}")
+    except Exception as e:
+        log(f"  [VAL] Mesh extraction note: {e}")
+
     return avg_val_loss
+
+
+def extract_mesh_sample(model, views, ccms, save_path, resolution=64, device="cuda"):
+    """Trích xuất mesh bằng Marching Cubes trên lưới resolution^3."""
+    import mcubes
+    model_eval = model.module if hasattr(model, "module") else model
+    model_eval.eval()
+    with torch.no_grad():
+        grid_coords = torch.linspace(-0.55, 0.55, resolution)
+        grid_x, grid_y, grid_z = torch.meshgrid(grid_coords, grid_coords, grid_coords, indexing="ij")
+        grid_points = torch.stack([grid_x, grid_y, grid_z], dim=-1).reshape(1, -1, 3).to(device)
+
+        chunk_size = 65536
+        sdf_list = []
+        B = views.shape[0]
+        views_flat = views.reshape(B, -1, views.shape[-2], views.shape[-1])
+        ccms_flat = ccms.reshape(B, -1, ccms.shape[-2], ccms.shape[-1])
+        x = torch.cat([views_flat, ccms_flat], dim=1)
+        triplane = model_eval.unet(x)
+
+        for i in range(0, grid_points.shape[1], chunk_size):
+            chunk_pts = grid_points[:, i:i+chunk_size]
+            features = model_eval.query_triplane(triplane, chunk_pts)
+            sdf_chunk, _ = model_eval.mlp(features)
+            sdf_list.append(sdf_chunk.cpu())
+
+        sdf_volume = torch.cat(sdf_list, dim=1).reshape(resolution, resolution, resolution).numpy()
+        try:
+            vertices, triangles = mcubes.marching_cubes(sdf_volume, 0.0)
+            if len(vertices) > 0:
+                vertices = vertices / (resolution - 1) * 1.1 - 0.55
+                mesh = trimesh.Trimesh(vertices=vertices, faces=triangles)
+                mesh.export(str(save_path))
+                return True
+        except Exception as e:
+            print(f"[WARN] Marching cubes export: {e}")
+    return False
 
 
 def create_dummy_dataset(config, num_objects=20):
