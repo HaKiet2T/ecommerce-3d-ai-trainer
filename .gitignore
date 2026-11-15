@@ -37,6 +37,8 @@ exported_models/
 static/generated_3d/
 outputs/
 data/
+*.log
+crm_ecommerce_dataset/
 
 # IDE & OS
 .vscode/

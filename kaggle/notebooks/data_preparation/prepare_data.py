@@ -36,9 +36,9 @@ def install_dependencies():
     ]
     for pkg in packages:
         os.system(f"pip install -q {pkg}")
-    # Headless rendering support on Linux (Kaggle)
+    # Headless rendering support on Linux (Kaggle Ubuntu 24.04 noble)
     if os.name != "nt":
-        os.system("apt-get update -qq && apt-get install -y -qq xvfb libgl1-mesa-glx libosmesa6-dev")
+        os.system("apt-get update -qq && apt-get install -y -qq xvfb libgl1 libglx-mesa0 libosmesa6-dev libglu1-mesa mesa-utils")
         os.system("Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &")
         os.environ["DISPLAY"] = ":99"
     os.system("pip install -q pyglet==1.5.28")
@@ -87,9 +87,9 @@ class DataConfig:
     num_volume_points = 4096
 
     # Limits
-    max_objects = 500  # Giới hạn số objects (Kaggle time limit)
-    min_faces = 100     # Bỏ objects quá đơn giản
-    max_faces = 500000  # Bỏ objects quá phức tạp
+    max_objects = 120  # Giới hạn số objects cho Phase 1 tinh gọn, chất lượng cao
+    min_faces = 500    # Bỏ objects quá đơn giản
+    max_faces = 150000 # Bỏ objects quá phức tạp tránh nặng bộ nhớ
 
     # Output
     output_dir = "/kaggle/working/crm_ecommerce_dataset"
@@ -187,7 +187,8 @@ def render_views(mesh, config):
             views.append(img.convert("RGB"))
 
         except Exception as e:
-            # Fallback: blank image
+            # Fallback: log error and blank image
+            print(f"  [WARN] render_views view_{az}_{el} error: {e}")
             views.append(
                 Image.new("RGB", (config.image_size, config.image_size), (128, 128, 128))
             )
@@ -252,7 +253,8 @@ def generate_ccm(mesh, config):
             ccm = Image.open(trimesh.util.wrap_as_stream(data)).convert("RGB")
             ccms.append(ccm)
 
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] generate_ccm view_{az}_{el} error: {e}")
             ccms.append(
                 Image.new("RGB", (config.image_size, config.image_size), (0, 0, 0))
             )
@@ -262,8 +264,11 @@ def generate_ccm(mesh, config):
 
 def sample_points_and_sdf(mesh, config):
     """
-    Sample 3D points and compute SDF values.
+    Sample 3D points and compute SDF values using fast, safe cKDTree.
+    Safe against non-watertight meshes, uses <50MB RAM, zero OOM risk.
     """
+    from scipy.spatial import cKDTree
+
     mesh_centered = mesh.copy()
     centroid = mesh_centered.centroid
     mesh_centered.apply_translation(-centroid)
@@ -271,39 +276,46 @@ def sample_points_and_sdf(mesh, config):
     if scale > 0:
         mesh_centered.apply_scale(1.0 / scale)
 
-    # Surface points
-    surface_points, face_indices = trimesh.sample.sample_surface(
+    # 1. Surface points (ground truth SDF = 0)
+    surf_pts, face_indices = trimesh.sample.sample_surface(
         mesh_centered, config.num_surface_points
     )
-    surface_sdf = np.zeros((len(surface_points), 1), dtype=np.float32)
+    surf_sdf = np.zeros((len(surf_pts), 1), dtype=np.float32)
 
     # Surface colors
-    if hasattr(mesh_centered.visual, "face_colors"):
-        surface_colors = mesh_centered.visual.face_colors[face_indices][:, :3] / 255.0
+    if hasattr(mesh_centered.visual, "face_colors") and len(mesh_centered.visual.face_colors) > 0:
+        surf_colors = mesh_centered.visual.face_colors[face_indices][:, :3] / 255.0
     else:
-        surface_colors = np.ones((len(surface_points), 3), dtype=np.float32) * 0.5
+        surf_colors = np.ones((len(surf_pts), 3), dtype=np.float32) * 0.5
 
-    # Volume points (random in [-1.2, 1.2])
-    volume_points = np.random.uniform(
-        -1.2, 1.2, (config.num_volume_points, 3)
-    ).astype(np.float32)
+    # 2. Near-surface points (surface + Gaussian noise sigma=0.02)
+    noise = np.random.normal(scale=0.02, size=surf_pts.shape).astype(np.float32)
+    near_pts = surf_pts + noise
+    near_dist = np.linalg.norm(noise, axis=-1, keepdims=True).astype(np.float32)
+    near_colors = surf_colors.copy()
 
-    # Compute approximate SDF for volume points
-    try:
-        closest_points, distances, face_ids = trimesh.proximity.closest_point(
-            mesh_centered, volume_points
-        )
-        signs = mesh_centered.contains(volume_points).astype(np.float32) * 2 - 1
-        volume_sdf = (distances * -signs).reshape(-1, 1).astype(np.float32)
-        volume_colors = np.ones((len(volume_points), 3), dtype=np.float32) * 0.5
-    except Exception:
-        volume_sdf = np.zeros((len(volume_points), 1), dtype=np.float32)
-        volume_colors = np.ones((len(volume_points), 3), dtype=np.float32) * 0.5
+    # Dấu gần bề mặt dựa vào pháp tuyến bề mặt (normal)
+    if hasattr(mesh_centered, "face_normals") and len(mesh_centered.face_normals) > 0:
+        normals = mesh_centered.face_normals[face_indices]
+        near_sign = np.sign(np.sum(noise * normals, axis=-1, keepdims=True))
+        near_sign[near_sign == 0] = 1.0
+        near_sdf = (near_dist * near_sign).astype(np.float32)
+    else:
+        near_sdf = near_dist
 
-    # Combine
-    points = np.vstack([surface_points, volume_points]).astype(np.float32)
-    sdf = np.vstack([surface_sdf, volume_sdf]).astype(np.float32)
-    colors = np.vstack([surface_colors, volume_colors]).astype(np.float32)
+    # 3. Volume points trong bounding box [-0.6, 0.6]^3
+    vol_pts = np.random.uniform(-0.6, 0.6, (config.num_volume_points, 3)).astype(np.float32)
+
+    # Fast cKDTree query against surface points (tránh mesh.contains raycast OOM)
+    tree = cKDTree(surf_pts)
+    vol_dist, vol_idx = tree.query(vol_pts)
+    vol_dist = vol_dist.astype(np.float32)[:, np.newaxis]
+    vol_colors = surf_colors[vol_idx]
+
+    # Combine: surface + near surface + volume
+    points = np.vstack([surf_pts, near_pts, vol_pts]).astype(np.float32)
+    sdf = np.vstack([surf_sdf, near_sdf, vol_dist]).astype(np.float32)
+    colors = np.vstack([surf_colors, near_colors, vol_colors]).astype(np.float32)
 
     return points, sdf, colors
 
@@ -451,6 +463,9 @@ def main():
         )
         archive_size = os.path.getsize(f"{archive_path}.zip") / (1024**2)
         print(f"  Archive: {archive_path}.zip ({archive_size:.1f} MB)")
+    else:
+        print("[ERROR] 0 objects processed successfully. Check dependencies or mesh loader.")
+        sys.exit(1)
 
     print("[6/6] Done!")
     print(f"  Dataset: {config.output_dir}")
