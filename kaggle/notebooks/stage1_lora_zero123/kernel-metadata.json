@@ -1,6 +1,6 @@
 {
   "id": "kith1618hgiakit/crm-3d-stage1",
-  "title": "CRM 3D - Stage 1 LoRA Zero123++ Fine-tune",
+  "title": "CRM 3D Stage1",
   "code_file": "train_stage1.py",
   "language": "python",
   "kernel_type": "script",
@@ -10,7 +10,7 @@
   "dataset_sources": [],
   "competition_sources": [],
   "kernel_sources": [
-    "kith1618hgiakit/crm-3d-data-prep"
+    "kith1618hgiakit/crm-3d-data-preparation-objaverse"
   ],
   "gpu_type": "NvidiaTeslaT4"
 }

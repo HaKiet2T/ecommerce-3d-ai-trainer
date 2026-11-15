@@ -36,6 +36,7 @@ STAGES = {
     "data_prep": {
         "dir": "data_preparation",
         "title": "CRM 3D - Data Preparation (Objaverse)",
+        "slug": "crm-3d-data-preparation-objaverse",
         "code_file": "prepare_data.py",
         "enable_gpu": False,
         "enable_internet": True,
@@ -45,24 +46,26 @@ STAGES = {
     },
     "stage1": {
         "dir": "stage1_lora_zero123",
-        "title": "CRM 3D - Stage 1 LoRA Zero123++ Fine-tune",
+        "title": "CRM 3D Stage1",
+        "slug": "crm-3d-stage1",
         "code_file": "train_stage1.py",
         "enable_gpu": True,
         "enable_internet": True,
         "max_runtime_hours": 12,
         "dataset_sources": [],
-        "kernel_sources": ["{username}/crm-3d-data-prep"],
+        "kernel_sources": ["{username}/crm-3d-data-preparation-objaverse"],
         "description": "LoRA fine-tune Zero123++ multi-view diffusion"
     },
     "stage2": {
         "dir": "stage2_crm_finetune",
-        "title": "CRM 3D - Stage 2 CRM Reconstruction Fine-tune",
+        "title": "CRM 3D Stage2",
+        "slug": "crm-3d-stage2",
         "code_file": "train_stage2.py",
         "enable_gpu": True,
         "enable_internet": True,
         "max_runtime_hours": 12,
         "dataset_sources": [],
-        "kernel_sources": ["{username}/crm-3d-data-prep"],
+        "kernel_sources": ["{username}/crm-3d-data-preparation-objaverse"],
         "description": "Fine-tune CRM U-Net triplane decoder + FlexiCubes"
     }
 }
@@ -148,7 +151,7 @@ def generate_metadata(stage_key: str, username: str = None):
         print("[ERROR] Không xác định được Kaggle username")
         return None
 
-    slug = f"crm-3d-{stage_key.replace('_', '-')}"
+    slug = stage.get("slug", f"crm-3d-{stage_key.replace('_', '-')}")
 
     raw_kernel_sources = stage.get("kernel_sources", [])
     kernel_sources = [ks.format(username=username) for ks in raw_kernel_sources]
@@ -224,7 +227,8 @@ def push_kernel(stage_key: str):
 def check_status(stage_key: str):
     """Kiểm tra trạng thái kernel đang chạy."""
     username = get_username()
-    slug = f"crm-3d-{stage_key.replace('_', '-')}"
+    stage = STAGES[stage_key]
+    slug = stage.get("slug", f"crm-3d-{stage_key.replace('_', '-')}")
     kernel_id = f"{username}/{slug}"
 
     result = subprocess.run(
@@ -283,7 +287,8 @@ def monitor_kernel(stage_key: str, poll_interval: int = 60, timeout_hours: float
 def download_output(stage_key: str):
     """Tải output (checkpoints, logs) từ kernel đã chạy xong."""
     username = get_username()
-    slug = f"crm-3d-{stage_key.replace('_', '-')}"
+    stage = STAGES[stage_key]
+    slug = stage.get("slug", f"crm-3d-{stage_key.replace('_', '-')}")
     kernel_id = f"{username}/{slug}"
 
     output_path = OUTPUT_DIR / stage_key / datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -1,6 +1,6 @@
 {
   "id": "kith1618hgiakit/crm-3d-stage2",
-  "title": "CRM 3D - Stage 2 CRM Reconstruction Fine-tune",
+  "title": "CRM 3D Stage2",
   "code_file": "train_stage2.py",
   "language": "python",
   "kernel_type": "script",
@@ -10,7 +10,7 @@
   "dataset_sources": [],
   "competition_sources": [],
   "kernel_sources": [
-    "kith1618hgiakit/crm-3d-data-prep"
+    "kith1618hgiakit/crm-3d-data-preparation-objaverse"
   ],
   "gpu_type": "NvidiaTeslaT4"
 }
