@@ -1,5 +1,5 @@
 {
-  "id": "kith1618hgiakit/crm-3d-data-prep",
+  "id": "kith1618hgiakit/crm-3d-data-preparation-objaverse",
   "title": "CRM 3D - Data Preparation (Objaverse)",
   "code_file": "prepare_data.py",
   "language": "python",
