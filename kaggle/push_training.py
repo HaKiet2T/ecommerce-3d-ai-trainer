@@ -298,7 +298,7 @@ def download_output(stage_key: str):
 
     result = subprocess.run(
         [get_kaggle_cmd(), "kernels", "output", kernel_id, "-p", str(output_path)],
-        capture_output=True, text=True, timeout=300
+        capture_output=True, text=True, timeout=1200
     )
 
     if result.returncode != 0:

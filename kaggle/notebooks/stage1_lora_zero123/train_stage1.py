@@ -295,6 +295,8 @@ def train(config):
     if not Path(dataset_path).exists() or not any(Path(dataset_path).glob("*/input.png")):
         log(f"[WARN] Dataset not found directly at {dataset_path}")
         candidate_paths = [
+            Path("/kaggle/input/crm-3d-data-preparation-objaverse/crm_ecommerce_dataset"),
+            Path("/kaggle/input/crm-3d-data-preparation-objaverse"),
             Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset"),
             Path("/kaggle/input/crm-3d-data-prep"),
             Path("/kaggle/input/crm-ecommerce-views"),
@@ -311,6 +313,7 @@ def train(config):
             zip_candidates = [
                 p.with_suffix(".zip"),
                 p / "crm_ecommerce_dataset.zip",
+                Path("/kaggle/input/crm-3d-data-preparation-objaverse/crm_ecommerce_dataset.zip"),
                 Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset.zip")
             ]
             for zp in zip_candidates:
