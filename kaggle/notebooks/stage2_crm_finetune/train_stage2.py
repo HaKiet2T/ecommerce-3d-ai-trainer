@@ -46,6 +46,7 @@ def install_dependencies():
         "trimesh",
         "lpips",
         "PyMCubes",
+        "huggingface_hub",
     ]
     for pkg in packages:
         os.system(f"pip install -q {pkg}")
@@ -57,6 +58,26 @@ def install_dependencies():
 
 print("[1/8] Installing dependencies...")
 install_dependencies()
+
+# Hugging Face Authentication
+HF_TOKEN = os.environ.get("HF_TOKEN") or "None"
+if not HF_TOKEN:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        HF_TOKEN = user_secrets.get_secret("HF_TOKEN")
+    except Exception:
+        pass
+
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+    try:
+        from huggingface_hub import login
+        login(token=HF_TOKEN, add_to_git_credential=False)
+        print("[HF] Authenticated successfully with Hugging Face Hub.")
+    except Exception as e:
+        print(f"[HF] Note: {e}")
 
 import torch
 import torch.nn as nn
@@ -546,9 +567,45 @@ def train(config):
     # Dataset
     log("[2/8] Loading dataset...")
     dataset_path = config.dataset_path
-    if not Path(dataset_path).exists():
-        log("[WARN] Dataset not found, creating dummy...")
-        dataset_path = create_dummy_dataset(config)
+    if not Path(dataset_path).exists() or not any(Path(dataset_path).glob("*/points.npy")):
+        log(f"[WARN] Dataset not found directly at {dataset_path}")
+        candidate_paths = [
+            Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset"),
+            Path("/kaggle/input/crm-3d-data-prep"),
+            Path("/kaggle/input/crm-ecommerce-views"),
+            Path("/kaggle/input/crm-ecommerce-dataset"),
+            Path("/kaggle/working/crm_ecommerce_dataset"),
+        ]
+        found = None
+        for p in candidate_paths:
+            if p.exists() and any(p.glob("*/points.npy")):
+                found = str(p)
+                log(f"[INFO] Found dataset directory at {found}")
+                break
+            zip_candidates = [
+                p.with_suffix(".zip"),
+                p / "crm_ecommerce_dataset.zip",
+                Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset.zip")
+            ]
+            for zp in zip_candidates:
+                if zp.exists():
+                    import zipfile
+                    log(f"[INFO] Unzipping dataset from {zp}...")
+                    extract_target = Path("/kaggle/working/extracted_dataset")
+                    extract_target.mkdir(parents=True, exist_ok=True)
+                    with zipfile.ZipFile(zp, "r") as zip_ref:
+                        zip_ref.extractall(extract_target)
+                    found = str(extract_target)
+                    log(f"[INFO] Extracted dataset to {found}")
+                    break
+            if found:
+                break
+
+        if found:
+            dataset_path = found
+        else:
+            log("[WARN] Dataset not found, creating dummy...")
+            dataset_path = create_dummy_dataset(config)
 
     train_dataset = CRMDataset(dataset_path, config.image_size, split="train")
     val_dataset = CRMDataset(dataset_path, config.image_size, split="val")
@@ -572,7 +629,8 @@ def train(config):
         log("[4/8] Downloading CRM checkpoint from HuggingFace...")
         ckpt_path = hf_hub_download(
             repo_id=config.crm_checkpoint,
-            filename="ccm-diffusion.pth"
+            filename="ccm-diffusion.pth",
+            token=HF_TOKEN
         )
         state_dict = torch.load(ckpt_path, map_location="cpu")
         # Load partial (chỉ matching keys)

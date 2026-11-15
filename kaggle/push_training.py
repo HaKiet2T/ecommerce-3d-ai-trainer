@@ -51,6 +51,7 @@ STAGES = {
         "enable_internet": True,
         "max_runtime_hours": 12,
         "dataset_sources": [],
+        "kernel_sources": ["{username}/crm-3d-data-prep"],
         "description": "LoRA fine-tune Zero123++ multi-view diffusion"
     },
     "stage2": {
@@ -61,16 +62,29 @@ STAGES = {
         "enable_internet": True,
         "max_runtime_hours": 12,
         "dataset_sources": [],
+        "kernel_sources": ["{username}/crm-3d-data-prep"],
         "description": "Fine-tune CRM U-Net triplane decoder + FlexiCubes"
     }
 }
+
+
+def get_kaggle_cmd():
+    """Tìm đường dẫn thực thi lệnh kaggle."""
+    cmd = shutil.which("kaggle")
+    if cmd:
+        return cmd
+    py_dir = Path(sys.executable).parent
+    for candidate in [py_dir / "kaggle.exe", py_dir / "kaggle", py_dir.parent / "Scripts" / "kaggle.exe"]:
+        if candidate.exists():
+            return str(candidate)
+    return "kaggle"
 
 
 def check_kaggle_cli():
     """Kiểm tra kaggle CLI đã cài và xác thực chưa."""
     try:
         result = subprocess.run(
-            ["kaggle", "--version"],
+            [get_kaggle_cmd(), "--version"],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
@@ -136,6 +150,9 @@ def generate_metadata(stage_key: str, username: str = None):
 
     slug = f"crm-3d-{stage_key.replace('_', '-')}"
 
+    raw_kernel_sources = stage.get("kernel_sources", [])
+    kernel_sources = [ks.format(username=username) for ks in raw_kernel_sources]
+
     metadata = {
         "id": f"{username}/{slug}",
         "title": stage["title"],
@@ -147,7 +164,7 @@ def generate_metadata(stage_key: str, username: str = None):
         "enable_internet": str(stage["enable_internet"]).lower(),
         "dataset_sources": stage["dataset_sources"],
         "competition_sources": [],
-        "kernel_sources": []
+        "kernel_sources": kernel_sources
     }
 
     # Thêm machine_shape nếu dùng GPU
@@ -192,7 +209,7 @@ def push_kernel(stage_key: str):
     print(f"{'='*60}\n")
 
     result = subprocess.run(
-        ["kaggle", "kernels", "push", "-p", str(stage_dir)],
+        [get_kaggle_cmd(), "kernels", "push", "-p", str(stage_dir)],
         capture_output=True, text=True, timeout=120
     )
 
@@ -211,7 +228,7 @@ def check_status(stage_key: str):
     kernel_id = f"{username}/{slug}"
 
     result = subprocess.run(
-        ["kaggle", "kernels", "status", kernel_id],
+        [get_kaggle_cmd(), "kernels", "status", kernel_id],
         capture_output=True, text=True, timeout=30
     )
 
@@ -275,7 +292,7 @@ def download_output(stage_key: str):
     print(f"[DOWNLOAD] Tải output về: {output_path}")
 
     result = subprocess.run(
-        ["kaggle", "kernels", "output", kernel_id, "-p", str(output_path)],
+        [get_kaggle_cmd(), "kernels", "output", kernel_id, "-p", str(output_path)],
         capture_output=True, text=True, timeout=300
     )
 
@@ -313,7 +330,7 @@ def upload_dataset(dataset_dir: str, dataset_slug: str, title: str = None):
 
     print(f"[UPLOAD] Dataset: {username}/{dataset_slug}")
     result = subprocess.run(
-        ["kaggle", "datasets", "create", "-p", dataset_dir],
+        [get_kaggle_cmd(), "datasets", "create", "-p", dataset_dir],
         capture_output=True, text=True, timeout=600
     )
 

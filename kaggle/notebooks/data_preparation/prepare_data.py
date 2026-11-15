@@ -36,9 +36,13 @@ def install_dependencies():
     ]
     for pkg in packages:
         os.system(f"pip install -q {pkg}")
-    # headless rendering support
+    # Headless rendering support on Linux (Kaggle)
+    if os.name != "nt":
+        os.system("apt-get update -qq && apt-get install -y -qq xvfb libgl1-mesa-glx libosmesa6-dev")
+        os.system("Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &")
+        os.environ["DISPLAY"] = ":99"
     os.system("pip install -q pyglet==1.5.28")
-    os.environ["PYOPENGL_PLATFORM"] = "egl"
+    os.environ["PYOPENGL_PLATFORM"] = "osmesa"
 
 print("[1/6] Installing dependencies...")
 install_dependencies()
@@ -363,16 +367,43 @@ def process_object(mesh_path, obj_id, output_dir, config):
         return False, str(e)
 
 
+def find_custom_models():
+    """Tìm các model 3D custom được tải lên (Hướng C: Hybrid)."""
+    search_dirs = [
+        Path("/kaggle/input"),
+        Path("./custom_models"),
+        Path("./data/custom"),
+    ]
+    custom_models = {}
+    for s_dir in search_dirs:
+        if s_dir.exists():
+            for ext in ["*.glb", "*.gltf", "*.obj"]:
+                for f in s_dir.rglob(ext):
+                    if "crm_ecommerce_dataset" not in str(f):
+                        uid = f"custom_{f.stem}_{len(custom_models):03d}"
+                        custom_models[uid] = str(f)
+    return custom_models
+
+
 def main():
     print("=" * 60)
-    print("  CRM 3D Data Preparation")
+    print("  CRM 3D Data Preparation (Hướng C: Hybrid)")
     print(f"  Time: {datetime.now().isoformat()}")
     print("=" * 60)
 
     os.makedirs(config.output_dir, exist_ok=True)
 
-    # Download objects
+    # Download Objaverse objects
     objects, uids = download_objaverse_subset(config)
+
+    # Hybrid (Hướng C): Tìm và nạp thêm custom models nếu có
+    custom_objects = find_custom_models()
+    if custom_objects:
+        print(f"\n[Hybrid Mode] Phát hiện {len(custom_objects)} custom 3D models từ input:")
+        for cuid, cpath in custom_objects.items():
+            print(f"  + {cuid}: {cpath}")
+            objects[cuid] = cpath
+            uids.append(cuid)
 
     # Process each object
     print(f"\n[3/6] Processing {len(objects)} objects...")

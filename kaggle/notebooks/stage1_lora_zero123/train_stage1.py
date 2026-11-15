@@ -41,6 +41,7 @@ def install_dependencies():
         "omegaconf",
         "lpips",
         "trimesh",
+        "huggingface_hub",
         "pytorch3d"  # Có thể cần build from source
     ]
     for pkg in packages:
@@ -53,6 +54,26 @@ def install_dependencies():
 
 print("[1/7] Installing dependencies...")
 install_dependencies()
+
+# Hugging Face Authentication
+HF_TOKEN = os.environ.get("HF_TOKEN") or "None"
+if not HF_TOKEN:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        HF_TOKEN = user_secrets.get_secret("HF_TOKEN")
+    except Exception:
+        pass
+
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+    try:
+        from huggingface_hub import login
+        login(token=HF_TOKEN, add_to_git_credential=False)
+        print("[HF] Authenticated successfully with Hugging Face Hub.")
+    except Exception as e:
+        print(f"[HF] Note: {e}")
 
 import torch
 import torch.nn as nn
@@ -203,7 +224,8 @@ def setup_model(config):
     pipe = DiffusionPipeline.from_pretrained(
         config.model_name,
         torch_dtype=torch.float16 if config.mixed_precision == "fp16" else torch.float32,
-        trust_remote_code=True
+        trust_remote_code=True,
+        token=HF_TOKEN
     )
 
     # Lấy UNet
@@ -270,10 +292,46 @@ def train(config):
     dataset_path = config.dataset_path
 
     # Kiểm tra dataset có tồn tại không
-    if not Path(dataset_path).exists():
-        log(f"[WARN] Dataset not found at {dataset_path}")
-        log("  Tạo dummy dataset để test pipeline...")
-        dataset_path = create_dummy_dataset(config)
+    if not Path(dataset_path).exists() or not any(Path(dataset_path).glob("*/input.png")):
+        log(f"[WARN] Dataset not found directly at {dataset_path}")
+        candidate_paths = [
+            Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset"),
+            Path("/kaggle/input/crm-3d-data-prep"),
+            Path("/kaggle/input/crm-ecommerce-views"),
+            Path("/kaggle/input/crm-ecommerce-dataset"),
+            Path("/kaggle/working/crm_ecommerce_dataset"),
+        ]
+        found = None
+        for p in candidate_paths:
+            if p.exists() and any(p.glob("*/input.png")):
+                found = str(p)
+                log(f"[INFO] Found dataset directory at {found}")
+                break
+            # Kiểm tra file zip từ output của kernel data_prep
+            zip_candidates = [
+                p.with_suffix(".zip"),
+                p / "crm_ecommerce_dataset.zip",
+                Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset.zip")
+            ]
+            for zp in zip_candidates:
+                if zp.exists():
+                    import zipfile
+                    log(f"[INFO] Unzipping dataset from {zp}...")
+                    extract_target = Path("/kaggle/working/extracted_dataset")
+                    extract_target.mkdir(parents=True, exist_ok=True)
+                    with zipfile.ZipFile(zp, "r") as zip_ref:
+                        zip_ref.extractall(extract_target)
+                    found = str(extract_target)
+                    log(f"[INFO] Extracted dataset to {found}")
+                    break
+            if found:
+                break
+
+        if found:
+            dataset_path = found
+        else:
+            log("  Tạo dummy dataset để test pipeline...")
+            dataset_path = create_dummy_dataset(config)
 
     train_dataset = MultiViewDataset(dataset_path, config.image_size, split="train")
     val_dataset = MultiViewDataset(dataset_path, config.image_size, split="val")
