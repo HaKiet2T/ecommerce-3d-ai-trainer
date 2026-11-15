@@ -33,34 +33,64 @@ def main():
     print("\n[2/4] Checking credentials...")
     kaggle_dir = Path.home() / ".kaggle"
     kaggle_json = kaggle_dir / "kaggle.json"
+    access_token = kaggle_dir / "access_token"
+    username_file = kaggle_dir / "username"
 
-    if kaggle_json.exists():
+    username = None
+    if access_token.exists():
+        print(f"  Found API Token: {access_token}")
+        if username_file.exists():
+            with open(username_file) as f:
+                username = f.read().strip()
+                print(f"  Username: {username}")
+        elif os.environ.get("KAGGLE_USERNAME"):
+            username = os.environ["KAGGLE_USERNAME"]
+            print(f"  Using env: KAGGLE_USERNAME={username}")
+        else:
+            print("  Vui long nhap Kaggle Username de lien ket voi API Token:")
+            username = input("  Kaggle Username: ").strip()
+            if username:
+                with open(username_file, "w") as f:
+                    f.write(username)
+                print(f"  Saved username to {username_file}")
+    elif kaggle_json.exists():
         with open(kaggle_json) as f:
             creds = json.load(f)
         print(f"  Found: {kaggle_json}")
-        print(f"  Username: {creds.get('username', 'N/A')}")
+        username = creds.get("username", "N/A")
+        print(f"  Username: {username}")
     elif os.environ.get("KAGGLE_USERNAME"):
-        print(f"  Using env: KAGGLE_USERNAME={os.environ['KAGGLE_USERNAME']}")
+        username = os.environ["KAGGLE_USERNAME"]
+        print(f"  Using env: KAGGLE_USERNAME={username}")
     else:
         print("  No credentials found!")
         print("\n  Cách lấy API token:")
         print("  1. Vào https://www.kaggle.com/settings")
         print("  2. Phần API -> Create New Token")
-        print("  3. Download kaggle.json")
+        print("  3. Download kaggle.json hoặc copy API Token")
 
         # Hỏi user nhập trực tiếp
         print("\n  Nhập credentials (hoặc Enter để skip):")
         username = input("  Kaggle Username: ").strip()
         if username:
-            api_key = input("  Kaggle API Key: ").strip()
-            if api_key:
+            token_or_key = input("  Kaggle API Key/Token: ").strip()
+            if token_or_key:
                 kaggle_dir.mkdir(exist_ok=True)
-                with open(kaggle_json, "w") as f:
-                    json.dump({"username": username, "key": api_key}, f)
-                # Set permissions (Unix)
+                if token_or_key.startswith("KGAT_"):
+                    with open(access_token, "w") as f:
+                        f.write(token_or_key)
+                    with open(username_file, "w") as f:
+                        f.write(username)
+                    print(f"  Saved access token to {access_token}")
+                else:
+                    with open(kaggle_json, "w") as f:
+                        json.dump({"username": username, "key": token_or_key}, f)
+                    print(f"  Saved to {kaggle_json}")
                 if os.name != "nt":
-                    os.chmod(kaggle_json, 0o600)
-                print(f"  Saved to {kaggle_json}")
+                    if access_token.exists():
+                        os.chmod(access_token, 0o600)
+                    if kaggle_json.exists():
+                        os.chmod(kaggle_json, 0o600)
             else:
                 print("  Skipped.")
                 return
@@ -87,10 +117,15 @@ def main():
     notebooks_dir = kaggle_dir_project / "notebooks"
 
     # Read username
-    if kaggle_json.exists():
+    if username:
+        pass
+    elif username_file.exists():
+        with open(username_file) as f:
+            username = f.read().strip()
+    elif kaggle_json.exists():
         with open(kaggle_json) as f:
-            username = json.load(f)["username"]
-    else:
+            username = json.load(f).get("username")
+    elif os.environ.get("KAGGLE_USERNAME"):
         username = os.environ["KAGGLE_USERNAME"]
 
     # Update all kernel-metadata.json

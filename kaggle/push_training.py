@@ -83,16 +83,23 @@ def check_kaggle_cli():
 
     # Kiểm tra credentials
     kaggle_json = Path.home() / ".kaggle" / "kaggle.json"
-    if kaggle_json.exists():
+    access_token = Path.home() / ".kaggle" / "access_token"
+    if access_token.exists():
+        print(f"[OK] Credentials: {access_token} (Kaggle API Token)")
+        return True
+    elif kaggle_json.exists():
         print(f"[OK] Credentials: {kaggle_json}")
+        return True
+    elif os.environ.get("KAGGLE_API_TOKEN"):
+        print("[OK] Credentials: env KAGGLE_API_TOKEN")
         return True
     elif KAGGLE_USERNAME:
         print(f"[OK] Credentials: env KAGGLE_USERNAME={KAGGLE_USERNAME}")
         return True
     else:
         print("[ERROR] Chưa có credentials.")
-        print("  Option 1: Đặt file ~/.kaggle/kaggle.json")
-        print("  Option 2: Set env KAGGLE_USERNAME + KAGGLE_KEY")
+        print("  Option 1: Đặt file ~/.kaggle/access_token hoặc ~/.kaggle/kaggle.json")
+        print("  Option 2: Set env KAGGLE_API_TOKEN hoặc KAGGLE_USERNAME + KAGGLE_KEY")
         print("  Lấy API token tại: https://www.kaggle.com/settings")
         return False
 
@@ -100,6 +107,12 @@ def check_kaggle_cli():
 def get_username():
     """Lấy Kaggle username từ credentials."""
     kaggle_json = Path.home() / ".kaggle" / "kaggle.json"
+    username_file = Path.home() / ".kaggle" / "username"
+    if username_file.exists():
+        with open(username_file) as f:
+            u = f.read().strip()
+            if u:
+                return u
     if kaggle_json.exists():
         with open(kaggle_json) as f:
             data = json.load(f)
