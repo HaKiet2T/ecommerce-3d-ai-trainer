@@ -1,0 +1,58 @@
+# ==============================================================================
+# Stage 1: LoRA Fine-tune Zero123++ Multi-View Diffusion Configuration
+# ==============================================================================
+
+model:
+  pretrained_model_name_or_path: "sudo-ai/zero123plus-v1.2"
+  subfolders:
+    unet: "unet"
+    vae: "vae"
+    vision_encoder: "vision_encoder"
+    scheduler: "scheduler"
+  lora:
+    rank: 32                      # Rank 32 de hoc chi tiet sac net cua vat the va do cong cong thai hoc
+    alpha: 64                     # Alpha = 2 * rank chuan hoa
+    dropout: 0.05
+    target_modules:
+      - "to_q"
+      - "to_k"
+      - "to_v"
+      - "to_out.0"
+      - "conv1"
+      - "conv2"
+
+data:
+  image_size: 256
+  num_views: 6
+  canonical_views:
+    - "front"
+    - "right"
+    - "back"
+    - "left"
+    - "top"
+    - "bottom"
+  dataset_path: "/kaggle/input/crm-ecommerce-views"
+
+training:
+  batch_size: 1                   # Toi uu cho GPU 16GB VRAM (T4 / RTX 4080)
+  gradient_accumulation_steps: 8  # Effective batch = 8 giup uoc luong gradient on dinh
+  learning_rate: 8.0e-5           # Learning rate phu hop cho rank 32
+  lr_scheduler: "cosine"
+  weight_decay: 0.01
+  num_train_steps: 8000           # 8000 steps dam bao hoi tu sau
+  warmup_steps: 800               # Lam am 10% tong so steps
+  save_every: 1000
+  log_every: 50
+  mixed_precision: "fp16"
+  gradient_checkpointing: true
+  seed: 42
+
+inference:
+  num_inference_steps: 30
+  guidance_scale: 4.0
+  image_size: 256
+
+output:
+  output_dir: "/kaggle/working/stage1_output"
+  checkpoint_dir: "/kaggle/working/stage1_checkpoints"
+  log_file: "/kaggle/working/stage1_train.log"

@@ -1,0 +1,34 @@
+# ==============================================================================
+# 3D Inference & Serving Microservice Configuration
+# ==============================================================================
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:3001"
+    - "*"
+
+crm:
+  checkpoint_path: "checkpoints/crm_best.pt"
+  device: "cuda"                  # cuda neu co GPU, cpu fallback tu dong
+  default_resolution: 64          # Do phan giai Marching Cubes (64 cho phan hoi nhanh, 128 cho mesh net)
+  max_resolution: 128
+  target_faces: 25000             # Mesh simplification decimation toi uu load Three.js / Next.js < 5MB
+  remove_background: true
+  output_formats:
+    - "glb"
+    - "obj"
+
+stage1_multiview:
+  model_name: "sudo-ai/zero123plus-v1.2"
+  lora_checkpoint_dir: "checkpoints/stage1_lora"
+  num_inference_steps: 30
+  guidance_scale: 4.0
+  image_size: 256
+
+storage:
+  output_dir: "static/generated_3d"
+  temp_dir: "outputs/inference_temp"

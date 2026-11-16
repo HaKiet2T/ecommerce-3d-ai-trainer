@@ -1,0 +1,43 @@
+# ==============================================================================
+# Stage 2: CRM (Convolutional Reconstruction Model) Fine-tuning Configuration
+# ==============================================================================
+
+model:
+  crm_checkpoint: "Zhengyi/CRM"
+  triplane_resolution: 256
+  triplane_channels: 32
+  mlp_hidden_dim: 64
+  sdf_threshold: 0.0
+
+data:
+  image_size: 256
+  num_views: 6
+  ccm_channels: 3                 # CCM duoc ma hoa RGB tu toa do XYZ
+  dataset_path: "data/ecommerce_processed"
+
+training:
+  batch_size: 2                   # 1 sample per T4 GPU voi DataParallel
+  gradient_accumulation_steps: 4  # Effective batch = 8
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  epochs: 30
+  num_train_steps: 8000           # 8000 steps de mang Triplane hoi tu chi tiet cao
+  warmup_steps: 800
+  save_every: 1000
+  eval_every: 1000
+  log_every: 50
+  mixed_precision: "fp16"
+  gradient_checkpointing: true
+  use_data_parallel: true
+
+loss_weights:
+  lambda_rgb: 1.0                 # RGB reconstruction loss
+  lambda_lpips: 0.5               # Perceptual loss
+  lambda_sdf: 0.2                 # SDF surface loss
+  lambda_eikonal: 0.05            # Eikonal gradient norm loss de triet tieu mang mo va ripple
+
+output:
+  output_dir: "outputs/stage2_crm"
+  checkpoint_dir: "checkpoints/stage2_crm"
+  mesh_output_dir: "outputs/stage2_crm/meshes"
+  log_file: "logs/stage2_train.log"
