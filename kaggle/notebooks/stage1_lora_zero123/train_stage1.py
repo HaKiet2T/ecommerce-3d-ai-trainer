@@ -30,24 +30,37 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 
 def install_dependencies():
-    """Cài đặt dependencies chưa có sẵn trên Kaggle."""
-    packages = [
-        "diffusers==0.27.2",
-        "transformers==4.40.2",
-        "accelerate==0.30.1",
-        "peft==0.10.0",
-        "safetensors",
-        "einops",
-        "omegaconf",
-        "lpips",
-        "trimesh",
-        "huggingface_hub",
-    ]
-    for pkg in packages:
-        os.system(f"pip install -q {pkg}")
+    """Cài đặt dependencies tương thích Python 3.13 trên Kaggle Ubuntu 24.04."""
+    # Gỡ bỏ torchao phiên bản cũ không tương thích trên Kaggle image
+    os.system("pip uninstall -y torchao")
+    cmd = (
+        "pip install -q "
+        "'huggingface_hub<0.26.0' "
+        "'diffusers>=0.30.0' "
+        "'transformers>=4.45.0' "
+        "'accelerate>=0.34.0' "
+        "'peft>=0.13.0' "
+        "safetensors einops omegaconf lpips trimesh"
+    )
+    res = os.system(cmd)
+    if res != 0:
+        os.system("pip install -q 'huggingface_hub<0.26.0' diffusers transformers accelerate peft safetensors einops omegaconf lpips trimesh")
 
 print("[1/7] Installing dependencies...")
 install_dependencies()
+
+# Monkey patch legacy cached_download for diffusers/remote pipelines
+try:
+    import huggingface_hub
+    if not hasattr(huggingface_hub, "cached_download"):
+        from huggingface_hub import hf_hub_download
+        huggingface_hub.cached_download = hf_hub_download
+except Exception:
+    pass
+
+# Vô hiệu hóa torchao trong sys.modules để PEFT dùng thuần PyTorch LoRA backend
+import sys
+sys.modules['torchao'] = None
 
 # Hugging Face Authentication
 HF_TOKEN = os.environ.get("HF_TOKEN") or "None"
@@ -80,8 +93,9 @@ import numpy as np
 # PEFT for LoRA
 from peft import LoraConfig, get_peft_model
 
-# Diffusers
-from diffusers import DiffusionPipeline, DDIMScheduler
+# Diffusers & Transformers Components (Load directly avoiding custom pipeline lookup errors)
+from diffusers import UNet2DConditionModel, AutoencoderKL, EulerAncestralDiscreteScheduler
+from transformers import CLIPVisionModelWithProjection
 
 # ---------------------------------------------------------------------------
 # 2. Config
@@ -174,6 +188,22 @@ class MultiViewDataset(Dataset):
             transforms.Normalize([0.5], [0.5])
         ])
 
+        # Transform cho grid target VAE [-1, 1]
+        self.grid_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        ])
+
+        # Transform chuẩn CLIP vision encoder (224x224, ImageNet mean/std)
+        self.clip_transform = transforms.Compose([
+            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.48145466, 0.4578275, 0.40821073],
+                std=[0.26862954, 0.26130258, 0.27577711]
+            )
+        ])
+
         print(f"[Dataset] {split}: {len(self.objects)} objects from {root_dir}")
 
     def __len__(self):
@@ -182,9 +212,10 @@ class MultiViewDataset(Dataset):
     def __getitem__(self, idx):
         obj_dir = self.objects[idx]
 
-        # Load input image
+        # Load input image (conditioning)
         input_img = Image.open(obj_dir / "input.png").convert("RGB")
         input_tensor = self.transform(input_img)
+        clip_tensor = self.clip_transform(input_img)
 
         # Load 6 target views
         views = []
@@ -193,15 +224,25 @@ class MultiViewDataset(Dataset):
             if view_path.exists():
                 view = Image.open(view_path).convert("RGB")
             else:
-                # Fallback: dùng input nếu thiếu view
                 view = input_img
-            views.append(self.transform(view))
+            views.append(view.resize((self.image_size, self.image_size), Image.BILINEAR))
 
-        target_views = torch.stack(views, dim=0)  # [6, 3, H, W]
+        # Ghép 6 góc nhìn thành canvas lưới 3x2 chuẩn của Zero123++
+        # Grid dimensions: rộng = 2 * 256 = 512, cao = 3 * 256 = 768
+        grid_img = Image.new("RGB", (self.image_size * 2, self.image_size * 3))
+        grid_img.paste(views[0], (0, 0))
+        grid_img.paste(views[1], (self.image_size, 0))
+        grid_img.paste(views[2], (0, self.image_size))
+        grid_img.paste(views[3], (self.image_size, self.image_size))
+        grid_img.paste(views[4], (0, self.image_size * 2))
+        grid_img.paste(views[5], (self.image_size, self.image_size * 2))
+
+        grid_tensor = self.grid_transform(grid_img)  # [3, 768, 512]
 
         return {
-            "input": input_tensor,           # [3, H, W]
-            "target_views": target_views,     # [6, 3, H, W]
+            "input": input_tensor,
+            "clip_input": clip_tensor,
+            "target_grid": grid_tensor,
             "object_id": obj_dir.name
         }
 
@@ -210,27 +251,59 @@ class MultiViewDataset(Dataset):
 # 4. Model setup: Zero123++ + LoRA
 # ---------------------------------------------------------------------------
 
-def setup_model(config):
-    """Load Zero123++ và thêm LoRA adapters."""
-    print("[2/7] Loading Zero123++ model...")
+class Zero123PlusComponents:
+    def __init__(self, unet, vae, vision_encoder, scheduler):
+        self.unet = unet
+        self.vae = vae
+        self.vision_encoder = vision_encoder
+        self.scheduler = scheduler
 
-    # Load pipeline
-    pipe = DiffusionPipeline.from_pretrained(
+
+def setup_model(config):
+    """Load Zero123++ components trực tiếp từ HuggingFace (UNet, VAE, VisionEncoder, Scheduler)."""
+    print("[2/7] Loading Zero123++ components directly...")
+    dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+
+    # Load UNet
+    unet = UNet2DConditionModel.from_pretrained(
         config.model_name,
-        torch_dtype=torch.float16 if config.mixed_precision == "fp16" else torch.float32,
-        trust_remote_code=True,
+        subfolder="unet",
+        torch_dtype=dtype,
         token=HF_TOKEN
     )
 
-    # Lấy UNet
-    unet = pipe.unet
+    # Load VAE
+    vae = AutoencoderKL.from_pretrained(
+        config.model_name,
+        subfolder="vae",
+        torch_dtype=dtype,
+        token=HF_TOKEN
+    )
+    vae.eval()
+    vae.requires_grad_(False)
 
-    # Bật gradient checkpointing để tiết kiệm VRAM
+    # Load Vision Encoder (CLIP)
+    vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
+        config.model_name,
+        subfolder="vision_encoder",
+        torch_dtype=dtype,
+        token=HF_TOKEN
+    )
+    vision_encoder.eval()
+    vision_encoder.requires_grad_(False)
+
+    # Load Scheduler
+    scheduler = EulerAncestralDiscreteScheduler.from_pretrained(
+        config.model_name,
+        subfolder="scheduler",
+        token=HF_TOKEN
+    )
+
     if config.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
-    # Thêm LoRA
-    print("[3/7] Adding LoRA adapters...")
+    # Thêm LoRA vào UNet
+    print("[3/7] Adding LoRA adapters to UNet...")
     lora_config = LoraConfig(
         r=config.lora_rank,
         lora_alpha=config.lora_alpha,
@@ -249,8 +322,11 @@ def setup_model(config):
     print(f"  Trainable %: {100 * trainable_params / total_params:.2f}%")
 
     unet = unet.to(config.device)
+    vae = vae.to(config.device)
+    vision_encoder = vision_encoder.to(config.device)
 
-    return pipe, unet
+    model_comps = Zero123PlusComponents(unet, vae, vision_encoder, scheduler)
+    return model_comps, unet
 
 
 # ---------------------------------------------------------------------------
@@ -277,58 +353,44 @@ def train(config):
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             name = torch.cuda.get_device_name(i)
-            mem = torch.cuda.get_device_properties(i).total_mem / 1e9
+            mem = torch.cuda.get_device_properties(i).total_memory / 1e9
             log(f"  GPU {i}: {name} ({mem:.1f} GB)")
     log("=" * 60)
 
-    # Dataset
-    log("[4/7] Loading dataset...")
-    dataset_path = config.dataset_path
-
-    # Kiểm tra dataset có tồn tại không
-    if not Path(dataset_path).exists() or not any(Path(dataset_path).glob("*/input.png")):
-        log(f"[WARN] Dataset not found directly at {dataset_path}")
-        candidate_paths = [
-            Path("/kaggle/input/crm-3d-data-preparation-objaverse/crm_ecommerce_dataset"),
-            Path("/kaggle/input/crm-3d-data-preparation-objaverse"),
-            Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset"),
-            Path("/kaggle/input/crm-3d-data-prep"),
-            Path("/kaggle/input/crm-ecommerce-views"),
-            Path("/kaggle/input/crm-ecommerce-dataset"),
-            Path("/kaggle/working/crm_ecommerce_dataset"),
-        ]
-        found = None
-        for p in candidate_paths:
-            if p.exists() and any(p.glob("*/input.png")):
-                found = str(p)
-                log(f"[INFO] Found dataset directory at {found}")
+    # Dataset search
+    log("[4/7] Searching for dataset in /kaggle/input/...")
+    dataset_path = None
+    input_root = Path("/kaggle/input")
+    if input_root.exists():
+        # Tìm file .zip để giải nén trước (tránh nghẽn I/O)
+        zip_files = list(input_root.rglob("*.zip"))
+        if zip_files:
+            zp = zip_files[0]
+            log(f"[INFO] Found dataset zip: {zp}")
+            extract_target = Path("/tmp/extracted_dataset")
+            extract_target.mkdir(parents=True, exist_ok=True)
+            import zipfile
+            with zipfile.ZipFile(zp, "r") as z:
+                z.extractall(extract_target)
+            log(f"[INFO] Extracted zip to: {extract_target}")
+            # Tìm thư mục chứa input.png
+            for candidate in extract_target.rglob("input.png"):
+                dataset_path = str(candidate.parent.parent)
+                log(f"[INFO] Dataset root detected at: {dataset_path}")
                 break
-            # Kiểm tra file zip từ output của kernel data_prep
-            zip_candidates = [
-                p.with_suffix(".zip"),
-                p / "crm_ecommerce_dataset.zip",
-                Path("/kaggle/input/crm-3d-data-preparation-objaverse/crm_ecommerce_dataset.zip"),
-                Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset.zip")
-            ]
-            for zp in zip_candidates:
-                if zp.exists():
-                    import zipfile
-                    log(f"[INFO] Unzipping dataset from {zp}...")
-                    extract_target = Path("/kaggle/working/extracted_dataset")
-                    extract_target.mkdir(parents=True, exist_ok=True)
-                    with zipfile.ZipFile(zp, "r") as zip_ref:
-                        zip_ref.extractall(extract_target)
-                    found = str(extract_target)
-                    log(f"[INFO] Extracted dataset to {found}")
-                    break
-            if found:
+            if not dataset_path:
+                dataset_path = str(extract_target)
+
+        # Nếu không có zip, tìm thư mục uncompressed có input.png
+        if not dataset_path:
+            for candidate in input_root.rglob("input.png"):
+                dataset_path = str(candidate.parent.parent)
+                log(f"[INFO] Found uncompressed dataset at: {dataset_path}")
                 break
 
-        if found:
-            dataset_path = found
-        else:
-            log("  Tạo dummy dataset để test pipeline...")
-            dataset_path = create_dummy_dataset(config)
+    if not dataset_path:
+        log("  Tạo dummy dataset để test pipeline...")
+        dataset_path = create_dummy_dataset(config)
 
     train_dataset = MultiViewDataset(dataset_path, config.image_size, split="train")
     val_dataset = MultiViewDataset(dataset_path, config.image_size, split="val")
@@ -350,9 +412,12 @@ def train(config):
         pin_memory=True
     )
 
-    # Model
-    pipe, unet = setup_model(config)
-    noise_scheduler = pipe.scheduler
+    # Model components
+    model_comps, unet = setup_model(config)
+    noise_scheduler = model_comps.scheduler
+    vae = model_comps.vae
+    vision_encoder = model_comps.vision_encoder
+    dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
 
     # Optimizer
     log("[5/7] Setting up optimizer...")
@@ -388,25 +453,18 @@ def train(config):
             if global_step >= config.num_train_steps:
                 break
 
-            input_images = batch["input"].to(config.device)       # [B, 3, H, W]
-            target_views = batch["target_views"].to(config.device) # [B, 6, 3, H, W]
+            target_grid = batch["target_grid"].to(config.device)  # [B, 3, 768, 512]
+            clip_input = batch["clip_input"].to(config.device)    # [B, 3, 224, 224]
+            B = target_grid.shape[0]
 
-            B = input_images.shape[0]
-
-            # Flatten views for batch processing
-            # [B*6, 3, H, W]
-            target_flat = target_views.reshape(B * 6, 3,
-                                               config.image_size,
-                                               config.image_size)
-
-            # Encode targets to latent
+            # 1. Encode target grid sang VAE latent [B, 4, 96, 64]
             with torch.no_grad():
-                latents = pipe.vae.encode(
-                    target_flat.half() if config.mixed_precision == "fp16" else target_flat
+                latents = vae.encode(
+                    target_grid.half() if config.mixed_precision == "fp16" else target_grid
                 ).latent_dist.sample()
-                latents = latents * pipe.vae.config.scaling_factor
+                latents = latents * vae.config.scaling_factor
 
-            # Sample noise
+            # 2. Sample noise và timestep
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps,
@@ -415,22 +473,17 @@ def train(config):
 
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # Encode input image as conditioning
+            # 3. Trích xuất đặc trưng CLIP vision cho conditioning [B, 1, 1024]
             with torch.no_grad():
-                cond_latents = pipe.vae.encode(
-                    input_images.half() if config.mixed_precision == "fp16" else input_images
-                ).latent_dist.sample()
-                cond_latents = cond_latents * pipe.vae.config.scaling_factor
-                # Repeat for each view
-                cond_latents = cond_latents.repeat(6, 1, 1, 1)
+                clip_embeds = vision_encoder(clip_input.to(dtype=dtype)).image_embeds
+                encoder_hidden_states = clip_embeds.unsqueeze(1).to(dtype=dtype)
 
-            # UNet forward
+            # 4. UNet forward pass (in_channels = 4, cross_attention_dim = 1024)
             with torch.amp.autocast("cuda", enabled=(config.mixed_precision == "fp16")):
-                # Concatenate conditioning
-                unet_input = torch.cat([noisy_latents, cond_latents], dim=1)
                 noise_pred = unet(
-                    unet_input,
-                    timesteps,
+                    sample=noisy_latents,
+                    timestep=timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
                     return_dict=False
                 )[0]
 
