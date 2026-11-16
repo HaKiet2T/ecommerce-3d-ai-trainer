@@ -36,7 +36,7 @@ exported_models/
 # Rendered outputs & 3D Assets
 static/generated_3d/
 outputs/
-data/
+/data/
 *.log
 *.zip
 *.tar.gz
