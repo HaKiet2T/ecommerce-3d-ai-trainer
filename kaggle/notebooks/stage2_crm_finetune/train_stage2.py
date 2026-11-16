@@ -116,8 +116,8 @@ class TrainConfig:
     # Loss weights (Gia tăng trọng số bảo toàn hình học và chuẩn hóa bề mặt)
     lambda_rgb = 1.0       # RGB reconstruction loss
     lambda_lpips = 0.5     # Perceptual loss
-    lambda_sdf = 0.2       # SDF surface loss (tăng gấp đôi để phạt sai lệch bề mặt)
-    lambda_eikonal = 0.05  # Eikonal (gradient norm) loss tăng từ 0.01 lên 0.05 triệt tiêu màng mờ và ripple
+    lambda_sdf = 0.5       # SDF surface loss (giám sát trực tiếp khoảng cách Euclid chuẩn từ cKDTree)
+    lambda_eikonal = 0.0   # Tắt symbolic Eikonal (create_graph) để triệt tiêu lỗi cudnn_grid_sampler_backward double-backward
 
     # Data
     image_size = 256
@@ -523,15 +523,19 @@ class CRMLoss(nn.Module):
         losses["rgb"] = color_loss * self.lambda_rgb
 
         # Eikonal loss (gradient norm should be 1)
-        if points is not None and points.requires_grad:
-            gradients = torch.autograd.grad(
-                outputs=pred_sdf,
-                inputs=points,
-                grad_outputs=torch.ones_like(pred_sdf),
-                create_graph=True
-            )[0]
-            eikonal = ((gradients.norm(dim=-1) - 1) ** 2).mean()
-            losses["eikonal"] = eikonal * self.lambda_eikonal
+        # Chỉ tính nếu lambda_eikonal > 0 và points.requires_grad
+        if self.lambda_eikonal > 0 and points is not None and getattr(points, "requires_grad", False):
+            try:
+                gradients = torch.autograd.grad(
+                    outputs=pred_sdf,
+                    inputs=points,
+                    grad_outputs=torch.ones_like(pred_sdf),
+                    create_graph=True
+                )[0]
+                eikonal = ((gradients.norm(dim=-1) - 1) ** 2).mean()
+                losses["eikonal"] = eikonal * self.lambda_eikonal
+            except RuntimeError:
+                pass
 
         # Total
         total = sum(losses.values())
@@ -627,19 +631,43 @@ def train(config):
             filename="CRM.pth",
             token=HF_TOKEN
         )
-        state_dict = torch.load(ckpt_path, map_location="cpu")
-        # Load partial (chỉ matching keys)
+        loaded = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(loaded, dict):
+            if "state_dict" in loaded:
+                state_dict = loaded["state_dict"]
+            elif "model" in loaded:
+                state_dict = loaded["model"]
+            elif "net" in loaded:
+                state_dict = loaded["net"]
+            else:
+                state_dict = loaded
+        else:
+            state_dict = loaded
+
         model_dict = model.state_dict()
-        pretrained_dict = {
-            k: v for k, v in state_dict.items()
-            if k in model_dict and v.shape == model_dict[k].shape
-        }
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict, strict=False)
-        log(f"  Loaded {len(pretrained_dict)}/{len(model_dict)} pretrained weights")
+        pretrained_dict = {}
+
+        # 1. Thử khớp trực tiếp
+        for k, v in state_dict.items():
+            if k in model_dict and v.shape == model_dict[k].shape:
+                pretrained_dict[k] = v
+                continue
+            # 2. Thử gỡ tiền tố phổ biến (module., generator., net., crm., unet.)
+            for pfx in ["module.", "generator.", "net.", "crm.", "unet."]:
+                if k.startswith(pfx):
+                    clean_k = k[len(pfx):]
+                    if clean_k in model_dict and v.shape == model_dict[clean_k].shape:
+                        pretrained_dict[clean_k] = v
+                        break
+
+        if len(pretrained_dict) > 0:
+            model.load_state_dict(pretrained_dict, strict=False)
+            log(f"  Loaded {len(pretrained_dict)}/{len(model_dict)} pretrained weights")
+        else:
+            log(f"  Pretrained weights note: {len(state_dict)} checkpoint keys vs {len(model_dict)} model keys. Training initialized weights.")
     except Exception as e:
         log(f"[WARN] Checkpoint load failed: {e}")
-        log("  Training from scratch...")
+        log("  Training with initialized weights...")
 
     # Gradient checkpointing
     if config.gradient_checkpointing:
@@ -706,8 +734,8 @@ def train(config):
             sdf_gt = batch["sdf_gt"].to(config.device)
             colors_gt = batch["colors_gt"].to(config.device)
 
-            # Enable grad for eikonal loss
-            points.requires_grad_(True)
+            # Giữ requires_grad=False cho points để tránh lỗi aten::cudnn_grid_sampler_backward double-backward
+            points.requires_grad_(False)
 
             with torch.amp.autocast("cuda", enabled=(config.mixed_precision == "fp16")):
                 pred_sdf, pred_color, triplane = model(views, ccms, points)
