@@ -36,23 +36,31 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 
 def install_dependencies():
-    packages = [
-        "diffusers==0.27.2",
-        "transformers==4.40.2",
-        "accelerate==0.30.1",
-        "safetensors",
-        "einops",
-        "omegaconf",
-        "trimesh",
-        "lpips",
-        "PyMCubes",
-        "huggingface_hub",
-    ]
-    for pkg in packages:
-        os.system(f"pip install -q {pkg}")
+    """Cài đặt dependencies tương thích Python 3.13 trên Kaggle Ubuntu 24.04."""
+    os.system("pip uninstall -y torchao")
+    cmd = (
+        "pip install -q "
+        "'huggingface_hub<0.26.0' "
+        "'diffusers>=0.30.0' "
+        "'transformers>=4.45.0' "
+        "'accelerate>=0.34.0' "
+        "safetensors einops omegaconf trimesh lpips PyMCubes"
+    )
+    res = os.system(cmd)
+    if res != 0:
+        os.system("pip install -q 'huggingface_hub<0.26.0' diffusers transformers accelerate safetensors einops omegaconf trimesh lpips PyMCubes")
 
 print("[1/8] Installing dependencies...")
 install_dependencies()
+
+# Monkey patch legacy cached_download for diffusers/remote pipelines
+try:
+    import huggingface_hub
+    if not hasattr(huggingface_hub, "cached_download"):
+        from huggingface_hub import hf_hub_download
+        huggingface_hub.cached_download = hf_hub_download
+except Exception:
+    pass
 
 # Hugging Face Authentication
 HF_TOKEN = os.environ.get("HF_TOKEN") or "None"
@@ -555,55 +563,44 @@ def train(config):
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             name = torch.cuda.get_device_name(i)
-            mem = torch.cuda.get_device_properties(i).total_mem / 1e9
+            mem = torch.cuda.get_device_properties(i).total_memory / 1e9
             log(f"  GPU {i}: {name} ({mem:.1f} GB)")
     log("=" * 60)
 
     # Dataset
-    log("[2/8] Loading dataset...")
-    dataset_path = config.dataset_path
-    if not Path(dataset_path).exists() or not any(Path(dataset_path).glob("*/points.npy")):
-        log(f"[WARN] Dataset not found directly at {dataset_path}")
-        candidate_paths = [
-            Path("/kaggle/input/crm-3d-data-preparation-objaverse/crm_ecommerce_dataset"),
-            Path("/kaggle/input/crm-3d-data-preparation-objaverse"),
-            Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset"),
-            Path("/kaggle/input/crm-3d-data-prep"),
-            Path("/kaggle/input/crm-ecommerce-views"),
-            Path("/kaggle/input/crm-ecommerce-dataset"),
-            Path("/kaggle/working/crm_ecommerce_dataset"),
-        ]
-        found = None
-        for p in candidate_paths:
-            if p.exists() and any(p.glob("*/points.npy")):
-                found = str(p)
-                log(f"[INFO] Found dataset directory at {found}")
+    log("[2/8] Searching for dataset in /kaggle/input/...")
+    dataset_path = None
+    input_root = Path("/kaggle/input")
+    if input_root.exists():
+        # Tìm file .zip để giải nén trước sang /tmp/extracted_dataset
+        zip_files = list(input_root.rglob("*.zip"))
+        if zip_files:
+            zp = zip_files[0]
+            log(f"[INFO] Found dataset zip: {zp}")
+            extract_target = Path("/tmp/extracted_dataset")
+            extract_target.mkdir(parents=True, exist_ok=True)
+            import zipfile
+            with zipfile.ZipFile(zp, "r") as z:
+                z.extractall(extract_target)
+            log(f"[INFO] Extracted zip to: {extract_target}")
+            # Tìm thư mục chứa points.npy
+            for candidate in extract_target.rglob("points.npy"):
+                dataset_path = str(candidate.parent.parent)
+                log(f"[INFO] Dataset root detected at: {dataset_path}")
                 break
-            zip_candidates = [
-                p.with_suffix(".zip"),
-                p / "crm_ecommerce_dataset.zip",
-                Path("/kaggle/input/crm-3d-data-preparation-objaverse/crm_ecommerce_dataset.zip"),
-                Path("/kaggle/input/crm-3d-data-prep/crm_ecommerce_dataset.zip")
-            ]
-            for zp in zip_candidates:
-                if zp.exists():
-                    import zipfile
-                    log(f"[INFO] Unzipping dataset from {zp}...")
-                    extract_target = Path("/kaggle/working/extracted_dataset")
-                    extract_target.mkdir(parents=True, exist_ok=True)
-                    with zipfile.ZipFile(zp, "r") as zip_ref:
-                        zip_ref.extractall(extract_target)
-                    found = str(extract_target)
-                    log(f"[INFO] Extracted dataset to {found}")
-                    break
-            if found:
+            if not dataset_path:
+                dataset_path = str(extract_target)
+
+        # Nếu không có zip, tìm thư mục uncompressed có points.npy
+        if not dataset_path:
+            for candidate in input_root.rglob("points.npy"):
+                dataset_path = str(candidate.parent.parent)
+                log(f"[INFO] Found uncompressed dataset at: {dataset_path}")
                 break
 
-        if found:
-            dataset_path = found
-        else:
-            log("[WARN] Dataset not found, creating dummy...")
-            dataset_path = create_dummy_dataset(config)
+    if not dataset_path:
+        log("[WARN] Dataset not found, creating dummy...")
+        dataset_path = create_dummy_dataset(config)
 
     train_dataset = CRMDataset(dataset_path, config.image_size, split="train")
     val_dataset = CRMDataset(dataset_path, config.image_size, split="val")
