@@ -36,4 +36,4 @@ ENV PYTHONUNBUFFERED=1
 ENV CRM_CHECKPOINT=/app/checkpoints/crm_best.pt
 
 # Lenh chay serving
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "src.serving.app:app", "--host", "0.0.0.0", "--port", "8000"]

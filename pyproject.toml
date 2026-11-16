@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecommerce-3d-ai-trainer"
+version = "1.0.0"
+description = "3D AI Reconstruction and Multi-View Training Pipeline for E-commerce"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "E-Commerce 3D AI Team"}
+]
+dependencies = [
+    "torch>=2.1.2",
+    "diffusers>=0.27.2",
+    "transformers>=4.40.2",
+    "trimesh>=4.0.5",
+    "fastapi>=0.110.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+    "black>=23.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
