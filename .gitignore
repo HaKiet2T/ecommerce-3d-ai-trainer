@@ -33,12 +33,22 @@ ENV/
 checkpoints/
 exported_models/
 
-# Rendered outputs
+# Rendered outputs & 3D Assets
 static/generated_3d/
 outputs/
 data/
 *.log
+*.zip
+*.tar.gz
+*.glb
+*.gltf
+*.obj
+*.ply
+*.stl
 crm_ecommerce_dataset/
+
+# Kaggle debug runs & local testing artifacts
+kaggle/debug*/
 
 # IDE & OS
 .vscode/
