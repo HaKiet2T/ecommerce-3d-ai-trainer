@@ -56,6 +56,21 @@ STAGES = {
         "kernel_sources": ["{username}/crm-3d-data-preparation-objaverse"],
         "description": "LoRA fine-tune Zero123++ multi-view diffusion"
     },
+    "stage1_sanity": {
+        "dir": "stage1_sanity_check",
+        "title": "CRM 3D Stage1 Sanity Check",
+        "slug": "crm-3d-stage1-sanity-check",
+        "code_file": "run_sanity.py",
+        "enable_gpu": True,
+        "enable_internet": True,
+        "max_runtime_hours": 1,
+        "dataset_sources": [],
+        "kernel_sources": [
+            "{username}/crm-3d-data-preparation-objaverse",
+            "{username}/crm-3d-stage1"
+        ],
+        "description": "Sanity check & visual validation of Stage 1 LoRA Zero123++"
+    },
     "stage2": {
         "dir": "stage2_crm_finetune",
         "title": "CRM 3D Stage2",
@@ -364,7 +379,7 @@ def main():
     )
     parser.add_argument(
         "--stage",
-        choices=["data_prep", "stage1", "stage2"],
+        choices=list(STAGES.keys()),
         required=True,
         help="Stage cần chạy"
     )

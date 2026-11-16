@@ -1,0 +1,18 @@
+{
+  "id": "kith1618hgiakit/crm-3d-stage1-sanity-check",
+  "title": "CRM 3D Stage1 Sanity Check",
+  "code_file": "run_sanity.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [
+    "kith1618hgiakit/crm-3d-data-preparation-objaverse",
+    "kith1618hgiakit/crm-3d-stage1"
+  ],
+  "model_sources": []
+}
