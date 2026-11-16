@@ -153,9 +153,9 @@ def run_evaluation():
         uncond_embeds = vision_encoder(torch.zeros_like(clip_tensor)).image_embeds.unsqueeze(1)
         text_embeddings = torch.cat([uncond_embeds, cond_embeds], dim=0)
 
-        # Khởi tạo latent ngẫu nhiên
+        # Khởi tạo latent ngẫu nhiên theo tỷ lệ chuẩn Zero123++ v1.2 (640x960, 2 cột x 3 hàng)
         torch.manual_seed(42)
-        latents = torch.randn((1, 4, 96, 64), device=device, dtype=dtype)
+        latents = torch.randn((1, 4, 120, 80), device=device, dtype=dtype)
         scheduler.set_timesteps(40)
         latents = latents * scheduler.init_noise_sigma
 
@@ -173,9 +173,10 @@ def run_evaluation():
         grid_np = (decoded.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).round().astype(np.uint8)
         grid_img = Image.fromarray(grid_np)
 
-        # Cắt 6 góc nhìn
-        coords = [(0, 0), (256, 0), (0, 256), (256, 256), (0, 512), (256, 512)]
-        pred_views = [grid_img.crop((x, y, x + 256, y + 256)) for x, y in coords]
+        # Cắt 6 góc nhìn từ lưới 640x960 (mỗi ô vuông 320x320) và chuẩn hóa về 256x256
+        cell = 320
+        coords = [(0, 0), (cell, 0), (0, cell), (cell, cell), (0, cell * 2), (cell, cell * 2)]
+        pred_views = [grid_img.crop((x, y, x + cell, y + cell)).resize((256, 256), Image.LANCZOS) for x, y in coords]
 
         # Đọc Ground Truth
         gt_views = []

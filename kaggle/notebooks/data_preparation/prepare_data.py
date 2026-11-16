@@ -141,14 +141,35 @@ def download_objaverse_subset(config):
 # Rendering
 # ---------------------------------------------------------------------------
 
+def get_rotation_matrix(az_deg: float, el_deg: float) -> np.ndarray:
+    """Tạo ma trận xoay 4x4 chuẩn xác theo góc Azimuth và Elevation."""
+    az = np.radians(az_deg)
+    el = np.radians(el_deg)
+    # Xoay quanh trục Y (Azimuth)
+    Ry = np.array([
+        [np.cos(-az), 0, np.sin(-az), 0],
+        [0, 1, 0, 0],
+        [-np.sin(-az), 0, np.cos(-az), 0],
+        [0, 0, 0, 1]
+    ], dtype=np.float64)
+    # Xoay quanh trục X (Elevation)
+    Rx = np.array([
+        [1, 0, 0, 0],
+        [0, np.cos(el), -np.sin(el), 0],
+        [0, np.sin(el), np.cos(el), 0],
+        [0, 0, 0, 1]
+    ], dtype=np.float64)
+    return Rx @ Ry
+
+
 def render_views(mesh, config):
     """
-    Render 6 orthographic views từ trimesh scene.
+    Render 6 orthographic views từ trimesh scene bằng cách xoay trực tiếp mesh.
     Returns: list of PIL images
     """
     views = []
 
-    # Normalize mesh to unit cube centered at origin
+    # Normalize mesh to unit cube centered at origin [-0.5, 0.5]
     mesh_centered = mesh.copy()
     centroid = mesh_centered.centroid
     mesh_centered.apply_translation(-centroid)
@@ -158,21 +179,12 @@ def render_views(mesh, config):
 
     for az, el in config.camera_poses:
         try:
-            scene = trimesh.Scene(mesh_centered)
+            rotated_mesh = mesh_centered.copy()
+            R = get_rotation_matrix(az, el)
+            rotated_mesh.apply_transform(R)
 
-            # Camera transform
-            az_rad = np.radians(az)
-            el_rad = np.radians(el)
-
-            cam_x = config.camera_distance * np.cos(el_rad) * np.sin(az_rad)
-            cam_y = config.camera_distance * np.sin(el_rad)
-            cam_z = config.camera_distance * np.cos(el_rad) * np.cos(az_rad)
-
-            camera_position = np.array([cam_x, cam_y, cam_z])
-
-            # Look at origin
+            scene = trimesh.Scene(rotated_mesh)
             scene.set_camera(
-                angles=None,
                 distance=config.camera_distance,
                 center=[0, 0, 0],
             )
@@ -198,8 +210,9 @@ def render_views(mesh, config):
 
 def generate_ccm(mesh, config):
     """
-    Generate Color Coordinate Maps (CCM) cho 6 views.
-    CCM encodes XYZ position as RGB colors.
+    Generate Canonical Coordinate Maps (CCM) cho 6 views:
+    Mã hóa tọa độ XYZ gốc trong [-0.5, 0.5] thành RGB cố định,
+    sau đó xoay mesh và render từ 6 góc nhìn trực giao.
     """
     ccms = []
 
@@ -210,42 +223,28 @@ def generate_ccm(mesh, config):
     if scale > 0:
         mesh_centered.apply_scale(1.0 / scale)
 
+    # 1. Gán màu đỉnh cố định theo tọa độ không gian chuẩn [-0.5, 0.5]
+    verts = mesh_centered.vertices
+    # Chuẩn hóa về [0, 255]
+    colors = np.clip((verts + 0.5) * 255.0, 0, 255).astype(np.uint8)
+    vertex_colors = np.column_stack([colors, np.full(len(colors), 255, dtype=np.uint8)])
+
     for az, el in config.camera_poses:
         try:
-            # Simplified CCM: project vertices and color by position
-            vertices = mesh_centered.vertices.copy()
-
-            # Rotate to camera view
-            az_rad = np.radians(az)
-            el_rad = np.radians(el)
-
-            # Rotation matrix
-            Ry = np.array([
-                [np.cos(az_rad), 0, np.sin(az_rad)],
-                [0, 1, 0],
-                [-np.sin(az_rad), 0, np.cos(az_rad)]
-            ])
-            Rx = np.array([
-                [1, 0, 0],
-                [0, np.cos(el_rad), -np.sin(el_rad)],
-                [0, np.sin(el_rad), np.cos(el_rad)]
-            ])
-
-            rotated = (Rx @ Ry @ vertices.T).T
-
-            # Normalize XYZ to [0, 255] for RGB encoding
-            xyz_normalized = (rotated - rotated.min(axis=0)) / (
-                rotated.max(axis=0) - rotated.min(axis=0) + 1e-8
+            rotated_mesh = mesh_centered.copy()
+            # Gán ColorVisuals rõ ràng để ghi đè mọi texture trước đó
+            rotated_mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=rotated_mesh, vertex_colors=vertex_colors
             )
-            colors = (xyz_normalized * 255).astype(np.uint8)
+            R = get_rotation_matrix(az, el)
+            rotated_mesh.apply_transform(R)
 
-            # Create colored mesh and render
-            colored_mesh = mesh_centered.copy()
-            colored_mesh.visual.vertex_colors = np.column_stack([
-                colors, np.full(len(colors), 255, dtype=np.uint8)
-            ])
+            scene = trimesh.Scene(rotated_mesh)
+            scene.set_camera(
+                distance=config.camera_distance,
+                center=[0, 0, 0],
+            )
 
-            scene = trimesh.Scene(colored_mesh)
             data = scene.save_image(
                 resolution=(config.image_size, config.image_size),
                 visible=False
