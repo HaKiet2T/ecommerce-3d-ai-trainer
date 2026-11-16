@@ -100,7 +100,7 @@ class CRMInferenceEngine:
         model = ConvolutionalReconstructionModel(
             triplane_resolution=256,
             triplane_channels=32,
-            base_features=64,
+            base_channels=64,
             hidden_dim=64
         ).to(self.device)
 
@@ -134,12 +134,18 @@ class CRMInferenceEngine:
 
         # 3. Model inference & Marching Cubes
         with torch.no_grad():
-            triplanes = self.model.unet(images, ccms)
+            B = images.shape[0]
+            x = torch.cat([images.view(B, 18, *images.shape[3:]),
+                           ccms.view(B, 18, *ccms.shape[3:])], dim=1)
+            triplanes = self.model.unet(x)
             mesh = self.model.extract_mesh(triplanes, resolution=resolution)
 
         # 4. Decimation / Simplification for Web
         if target_faces > 0 and len(mesh.faces) > target_faces:
-            mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+            try:
+                mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+            except Exception:
+                pass
 
         elapsed = time.time() - start_time
         return mesh, elapsed

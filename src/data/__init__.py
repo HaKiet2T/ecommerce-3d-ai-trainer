@@ -9,8 +9,6 @@ from .dataset import (
     generate_ccm_from_rgb,
     normalize_mesh,
     sample_sdf_points_from_mesh,
-    get_camera_rays,
-    render_orthographic_depth_and_mask
 )
 
 __all__ = [
@@ -20,6 +18,4 @@ __all__ = [
     "generate_ccm_from_rgb",
     "normalize_mesh",
     "sample_sdf_points_from_mesh",
-    "get_camera_rays",
-    "render_orthographic_depth_and_mask"
 ]

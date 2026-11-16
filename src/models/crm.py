@@ -1,5 +1,15 @@
+"""
+Convolutional Reconstruction Model (CRM) Architecture
+====================================================
+End-to-end 3D reconstruction model:
+1. Multi-view & CCM feature representation (36 input channels)
+2. Convolutional U-Net generating Triplane features (XY, XZ, YZ planes)
+3. Implicit MLP Decoder querying Signed Distance Function (SDF) and RGB Albedo
+4. Marching Cubes extraction for textured 3D meshes
+"""
+
 import math
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -12,296 +22,229 @@ try:
 except ImportError:
     mcubes = None
 
-class ConvBlock(nn.Module):
-    """Khoi Convolution co ban gom 2 layer Conv2d + GroupNorm + SiLU."""
-    def __init__(self, in_channels: int, out_channels: int):
+
+class DoubleConv(nn.Module):
+    """Double convolution block with GroupNorm and GELU."""
+    def __init__(self, in_ch: int, out_ch: int, mid_ch: Optional[int] = None):
         super().__init__()
-        num_groups = min(8, out_channels)
-        while out_channels % num_groups != 0 and num_groups > 1:
-            num_groups -= 1
+        if not mid_ch:
+            mid_ch = out_ch
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(num_groups, out_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(num_groups, out_channels),
-            nn.SiLU(inplace=True)
+            nn.Conv2d(in_ch, mid_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(8, mid_ch),
+            nn.GELU(),
+            nn.Conv2d(mid_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
 
-class DownSample(nn.Module):
-    """Khoi giam chieu khong gian bang Conv stride 2."""
-    def __init__(self, in_channels: int, out_channels: int):
+
+class Down(nn.Module):
+    """Downsampling block via MaxPool2d and DoubleConv."""
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        self.down = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(min(8, out_channels), out_channels),
-            nn.SiLU(inplace=True)
+        self.pool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_ch, out_ch)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(x)
+        return self.pool_conv(x)
 
-class UpSample(nn.Module):
-    """Khoi tang chieu khong gian bang Bilinear Upsample + Conv."""
-    def __init__(self, in_channels: int, out_channels: int):
+
+class Up(nn.Module):
+    """Upsampling block with skip connection."""
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        self.up = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(min(8, out_channels), out_channels),
-            nn.SiLU(inplace=True)
-        )
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv = DoubleConv(in_ch, out_ch, in_ch // 2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.up(x)
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        x1 = self.up(x1)
+        diff_y = x2.size(2) - x1.size(2)
+        diff_x = x2.size(3) - x1.size(3)
+        x1 = F.pad(x1, [diff_x // 2, diff_x - diff_x // 2,
+                        diff_y // 2, diff_y - diff_y // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
 
-class MultiViewUNet(nn.Module):
+
+class CRMUNet(nn.Module):
     """
-    Mang U-Net tich chap bien doi 6 goc nhin truc giao (RGB + CCM)
-    thanh 3 mat phang truc giao Triplane (XY, XZ, YZ).
-    Dung kien truc Convolution thay vi Transformer giup tiet kiem VRAM,
-    chay tot tren 1 GPU don le (T4/A100) va tang toc do suy luan gap 5-10 lan.
+    CRM Convolutional U-Net for Triplane Generation.
+    Input: 6 RGB views (concatenated) + 6 CCMs = [B, 36, H, W]
+    Output: Triplane features [B, triplane_channels * 3, H, W] (XY, XZ, YZ planes)
     """
-    def __init__(
-        self,
-        in_channels_per_view: int = 6, # 3 channels RGB + 3 channels CCM
-        num_views: int = 6,
-        triplane_channels: int = 32,
-        base_features: int = 64
-    ):
+    def __init__(self, in_channels: int = 36, triplane_channels: int = 32, base_channels: int = 64):
         super().__init__()
-        self.num_views = num_views
+        self.in_channels = in_channels
         self.triplane_channels = triplane_channels
-
-        # Dau vao la 6 views ghep lai: total_in = 6 views * 6 channels = 36 channels
-        total_in = in_channels_per_view * num_views
-
-        # Encoder U-Net
-        self.inc = ConvBlock(total_in, base_features)
-        self.down1 = DownSample(base_features, base_features * 2)
-        self.conv1 = ConvBlock(base_features * 2, base_features * 2)
-
-        self.down2 = DownSample(base_features * 2, base_features * 4)
-        self.conv2 = ConvBlock(base_features * 4, base_features * 4)
-
-        self.down3 = DownSample(base_features * 4, base_features * 8)
-        self.conv3 = ConvBlock(base_features * 8, base_features * 8)
-
-        # Bottleneck
-        self.bottleneck = ConvBlock(base_features * 8, base_features * 8)
-
-        # Decoder U-Net
-        self.up1 = UpSample(base_features * 8, base_features * 4)
-        self.up_conv1 = ConvBlock(base_features * 8, base_features * 4)
-
-        self.up2 = UpSample(base_features * 4, base_features * 2)
-        self.up_conv2 = ConvBlock(base_features * 4, base_features * 2)
-
-        self.up3 = UpSample(base_features * 2, base_features)
-        self.up_conv3 = ConvBlock(base_features * 2, base_features)
-
-        # Head sinh 3 mat phang Triplane (XY, XZ, YZ): 3 * triplane_channels
-        self.out_head = nn.Conv2d(
-            base_features,
-            3 * triplane_channels,
-            kernel_size=3,
-            padding=1
-        )
-
-    def forward(self, images: torch.Tensor, ccms: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            images: [B, 6, 3, H, W]
-            ccms:   [B, 6, 3, H, W]
-        Returns:
-            triplanes: [B, 3, triplane_channels, H, W]
-        """
-        B, V, C_img, H, W = images.shape
-        # Ghep kenh RGB va CCM cua moi view -> [B, 6, 6, H, W]
-        view_features = torch.cat([images, ccms], dim=2)
-        # Reshape ghep 6 view thanh chieu kenh duy nhat -> [B, 36, H, W]
-        x = view_features.view(B, V * (C_img + ccms.shape[2]), H, W)
+        out_channels = triplane_channels * 3
 
         # Encoder
-        x0 = self.inc(x)
-        x1 = self.conv1(self.down1(x0))
-        x2 = self.conv2(self.down2(x1))
-        x3 = self.conv3(self.down3(x2))
+        self.inc = DoubleConv(in_channels, base_channels)
+        self.down1 = Down(base_channels, base_channels * 2)
+        self.down2 = Down(base_channels * 2, base_channels * 4)
+        self.down3 = Down(base_channels * 4, base_channels * 8)
+        self.down4 = Down(base_channels * 8, base_channels * 8)
 
-        # Bottleneck
-        bn = self.bottleneck(x3)
+        # Decoder
+        self.up1 = Up(base_channels * 16, base_channels * 4)
+        self.up2 = Up(base_channels * 8, base_channels * 2)
+        self.up3 = Up(base_channels * 4, base_channels)
+        self.up4 = Up(base_channels * 2, base_channels)
 
-        # Decoder voi Skip Connections
-        d1 = self.up1(bn)
-        d1 = self.up_conv1(torch.cat([d1, x2], dim=1))
+        # Output head
+        self.outc = nn.Conv2d(base_channels, out_channels, 1)
 
-        d2 = self.up2(d1)
-        d2 = self.up_conv2(torch.cat([d2, x1], dim=1))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
 
-        d3 = self.up3(d2)
-        d3 = self.up_conv3(torch.cat([d3, x0], dim=1))
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
 
-        # Triplanes projection
-        out = self.out_head(d3) # [B, 3 * C_plane, H, W]
-        triplanes = out.view(B, 3, self.triplane_channels, H, W)
-        return triplanes
+        return self.outc(x)
 
-class TriplaneSDFDecoder(nn.Module):
+
+class TriplaneMLP(nn.Module):
     """
-    Giai ma dac trung Triplane tai toa do diem 3D bat ky (x, y, z):
-    1. Chieu p len 3 mat phang XY, XZ, YZ
-    2. Trich xuat feature bang phep noi suy song tuyen (Bilinear Interpolation)
-    3. Ghep dac trung va du doan SDF kem mau RGB (Albedo) qua MLP
+    MLP decoder: triplane features -> SDF + Color per 3D point.
     """
     def __init__(self, triplane_channels: int = 32, hidden_dim: int = 64):
         super().__init__()
-        self.triplane_channels = triplane_channels
-
-        # Input vao MLP: 3 * triplane_channels + 3 toa do (x, y, z)
-        in_dim = 3 * triplane_channels + 3
-
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(inplace=True),
+        self.sdf_net = nn.Sequential(
+            nn.Linear(triplane_channels, hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1)
         )
 
-        # Dau ra SDF (1 channel)
-        self.sdf_head = nn.Linear(hidden_dim, 1)
-        # Dau ra RGB Color (3 channels trong khoang [0, 1])
-        self.rgb_head = nn.Sequential(
+        self.color_net = nn.Sequential(
+            nn.Linear(triplane_channels, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 3),
             nn.Sigmoid()
         )
 
-    def sample_triplane_features(
-        self,
-        triplanes: torch.Tensor,
-        points: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Trich xuat dac trung tai toa do diem 3D.
-        Args:
-            triplanes: [B, 3, C, H, W]
-            points: [B, N, 3] trong khoang [-0.5, 0.5]
-        Returns:
-            features: [B, N, 3 * C]
-        """
-        B, N, _ = points.shape
-        C = self.triplane_channels
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        sdf = self.sdf_net(features)
+        color = self.color_net(features)
+        return sdf, color
 
-        # Chuan hoa toa do ve dai [-1, 1] cho F.grid_sample
-        # Do diem 3D nam trong [-0.5, 0.5]
-        norm_pts = points * 2.0 # [-1, 1]
 
-        # Tinh toa do tren tung mat phang chieu
-        # XY plane: x, y
-        grid_xy = norm_pts[:, :, [0, 1]].view(B, N, 1, 2)
-        # XZ plane: x, z
-        grid_xz = norm_pts[:, :, [0, 2]].view(B, N, 1, 2)
-        # YZ plane: y, z
-        grid_yz = norm_pts[:, :, [1, 2]].view(B, N, 1, 2)
-
-        feat_xy = F.grid_sample(triplanes[:, 0], grid_xy, mode="bilinear", padding_mode="border", align_corners=False)
-        feat_xz = F.grid_sample(triplanes[:, 1], grid_xz, mode="bilinear", padding_mode="border", align_corners=False)
-        feat_yz = F.grid_sample(triplanes[:, 2], grid_yz, mode="bilinear", padding_mode="border", align_corners=False)
-
-        # Reshape ve [B, N, C]
-        feat_xy = feat_xy.view(B, C, N).permute(0, 2, 1)
-        feat_xz = feat_xz.view(B, C, N).permute(0, 2, 1)
-        feat_yz = feat_yz.view(B, C, N).permute(0, 2, 1)
-
-        # Ghep 3 mat phang thanh dac trung tong hop [B, N, 3 * C]
-        combined_feat = torch.cat([feat_xy, feat_xz, feat_yz], dim=-1)
-        return combined_feat
-
-    def forward(
-        self,
-        triplanes: torch.Tensor,
-        points: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Du doan SDF va mau RGB tai tap diem 3D.
-        Returns:
-            pred_sdf: [B, N, 1]
-            pred_rgb: [B, N, 3]
-        """
-        sampled_features = self.sample_triplane_features(triplanes, points)
-        # Ghep toa do goc vao vector dac trung
-        mlp_in = torch.cat([sampled_features, points], dim=-1)
-
-        hidden = self.mlp(mlp_in)
-        pred_sdf = self.sdf_head(hidden)
-        pred_rgb = self.rgb_head(hidden)
-
-        return pred_sdf, pred_rgb
-
-class ConvolutionalReconstructionModel(nn.Module):
+class CRMModel(nn.Module):
     """
-    Toan bo kien truc CRM (Convolutional Reconstruction Model):
-    - Input: 6 goc nhin RGB + 6 CCMs
-    - Triplane Generator: MultiViewUNet sinh 3 mat phang XY, XZ, YZ
-    - Implicit Decoder: TriplaneSDFDecoder giai ma SDF va Color
-    - Khong gian mesh: Marching Cubes hoac FlexiCubes de xuat 3D mesh textured
+    Full CRM Model: U-Net encoder + Triplane + MLP decoder.
     """
     def __init__(
         self,
+        in_channels: int = 36,
         triplane_channels: int = 32,
-        base_features: int = 64,
-        hidden_dim: int = 64
+        base_channels: int = 64,
+        hidden_dim: int = 64,
+        triplane_resolution: int = 256
     ):
         super().__init__()
-        self.unet = MultiViewUNet(
-            in_channels_per_view=6,
-            num_views=6,
+        self.triplane_channels = triplane_channels
+        self.triplane_resolution = triplane_resolution
+
+        self.unet = CRMUNet(
+            in_channels=in_channels,
             triplane_channels=triplane_channels,
-            base_features=base_features
+            base_channels=base_channels
         )
-        self.decoder = TriplaneSDFDecoder(
+
+        self.mlp = TriplaneMLP(
             triplane_channels=triplane_channels,
             hidden_dim=hidden_dim
         )
 
+    def query_triplane(self, triplane: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+        """
+        Truy van triplane tai cac diem 3D.
+        Args:
+            triplane: [B, C*3, H, W]
+            points: [B, N, 3] trong khoang [-1, 1] hoac [-0.5, 0.5]
+        Returns:
+            features: [B, N, C]
+        """
+        B, _, H, W = triplane.shape
+        C = self.triplane_channels
+        N = points.shape[1]
+
+        xy_plane = triplane[:, :C]
+        xz_plane = triplane[:, C:2*C]
+        yz_plane = triplane[:, 2*C:]
+
+        # Sample coordinates directly matching train_stage2.py
+        xy_coords = points[:, :, :2].unsqueeze(2)
+        xz_coords = points[:, :, [0, 2]].unsqueeze(2)
+        yz_coords = points[:, :, [1, 2]].unsqueeze(2)
+
+        f_xy = F.grid_sample(xy_plane, xy_coords, align_corners=True, mode="bilinear")
+        f_xz = F.grid_sample(xz_plane, xz_coords, align_corners=True, mode="bilinear")
+        f_yz = F.grid_sample(yz_plane, yz_coords, align_corners=True, mode="bilinear")
+
+        f_xy = f_xy.squeeze(-1).permute(0, 2, 1)
+        f_xz = f_xz.squeeze(-1).permute(0, 2, 1)
+        f_yz = f_yz.squeeze(-1).permute(0, 2, 1)
+
+        features = f_xy + f_xz + f_yz
+        return features
+
     def forward(
         self,
-        images: torch.Tensor,
+        views: torch.Tensor,
         ccms: torch.Tensor,
         points: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Lan truyen thuan:
-        - Sinh Triplane features
-        - Neu co points: truy van SDF va RGB cho huan luyen
+        Forward pass.
+        Args:
+            views: [B, 6, 3, H, W]
+            ccms:  [B, 6, 3, H, W]
+            points: [B, N, 3] optional
         """
-        triplanes = self.unet(images, ccms)
-        output = {"triplanes": triplanes}
+        B = views.shape[0]
+        # Concat views and ccms along channel dim: [B, 36, H, W]
+        x = torch.cat([views.view(B, 18, *views.shape[3:]),
+                       ccms.view(B, 18, *ccms.shape[3:])], dim=1)
+
+        triplane = self.unet(x)
+        output = {"triplane": triplane}
 
         if points is not None:
-            pred_sdf, pred_rgb = self.decoder(triplanes, points)
-            output["pred_sdf"] = pred_sdf
-            output["pred_rgb"] = pred_rgb
+            features = self.query_triplane(triplane, points)
+            sdf, color = self.mlp(features)
+            output["pred_sdf"] = sdf
+            output["pred_rgb"] = color
 
         return output
 
     @torch.no_grad()
     def extract_mesh(
         self,
-        triplanes: torch.Tensor,
+        triplane: torch.Tensor,
         resolution: int = 64,
         threshold: float = 0.0,
         chunk_size: int = 65536
     ) -> trimesh.Trimesh:
         """
-        Tich xuat tam giac 3D Mesh tu truong SDF bang Marching Cubes.
-        Chia nho chunk_size de dam bao khong bi tran VRAM tren GPU T4.
+        Extract 3D triangle mesh from SDF volume via Marching Cubes.
         """
-        device = triplanes.device
+        device = triplane.device
         grid_vals = np.linspace(-0.5, 0.5, resolution, dtype=np.float32)
         X, Y, Z = np.meshgrid(grid_vals, grid_vals, grid_vals, indexing="ij")
         grid_points = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
@@ -309,38 +252,42 @@ class ConvolutionalReconstructionModel(nn.Module):
         num_pts = grid_points.shape[0]
         sdf_vals = np.zeros(num_pts, dtype=np.float32)
 
-        # Truy van SDF theo tung batch de tiet kiem bo nho
         for start_idx in range(0, num_pts, chunk_size):
             end_idx = min(start_idx + chunk_size, num_pts)
             chunk_pts = torch.from_numpy(grid_points[start_idx:end_idx]).unsqueeze(0).to(device)
-            pred_sdf, _ = self.decoder(triplanes, chunk_pts)
+            feat = self.query_triplane(triplane, chunk_pts)
+            pred_sdf, _ = self.mlp(feat)
             sdf_vals[start_idx:end_idx] = pred_sdf.squeeze().cpu().numpy()
 
         sdf_volume = sdf_vals.reshape(resolution, resolution, resolution)
 
-        # Chay Marching Cubes
+        # Dynamic threshold adjustment if level is outside volume range
+        vol_min = float(sdf_volume.min())
+        vol_max = float(sdf_volume.max())
+        target_level = threshold
+        if target_level <= vol_min or target_level >= vol_max:
+            # Fallback to median/mean level to ensure surface extraction
+            target_level = float(np.percentile(sdf_volume, 30))
+
         if mcubes is not None:
-            vertices, triangles = mcubes.marching_cubes(sdf_volume, threshold)
-            # Chuyen toa do index ve khong gian thuc [-0.5, 0.5]
+            vertices, triangles = mcubes.marching_cubes(sdf_volume, target_level)
             vertices = vertices / (resolution - 1) - 0.5
         else:
-            # Fallback thuat toan Marching Cubes don gian neu chua compile PyMCubes
             from skimage import measure
             vertices, triangles, _, _ = measure.marching_cubes(
-                sdf_volume, level=threshold, spacing=(1.0/resolution, 1.0/resolution, 1.0/resolution)
+                sdf_volume, level=target_level, spacing=(1.0/resolution, 1.0/resolution, 1.0/resolution)
             )
             vertices = vertices - 0.5
 
         if len(vertices) == 0:
-            # Fallback hinh cau neu vat the bi rong
             return trimesh.creation.icosphere(radius=0.3)
 
-        # Truy van mau sac RGB tai cac dinh mesh
+        # Query vertex RGB
         vert_tensor = torch.from_numpy(vertices.astype(np.float32)).unsqueeze(0).to(device)
-        _, vert_rgb = self.decoder(triplanes, vert_tensor)
+        vert_feat = self.query_triplane(triplane, vert_tensor)
+        _, vert_rgb = self.mlp(vert_feat)
         vert_rgb_np = (vert_rgb.squeeze(0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
 
-        # Tao trimesh kem mau dinh
         mesh = trimesh.Trimesh(
             vertices=vertices,
             faces=triangles,
@@ -348,3 +295,9 @@ class ConvolutionalReconstructionModel(nn.Module):
             process=True
         )
         return mesh
+
+
+# Alias for backward compatibility
+ConvolutionalReconstructionModel = CRMModel
+MultiViewUNet = CRMUNet
+TriplaneSDFDecoder = TriplaneMLP
