@@ -252,14 +252,24 @@ class CRMDataset(Dataset):
         # Moi thu muc con la mot san pham (desk, chair, monitor, etc.)
         self.sample_dirs = [
             d for d in self.data_root.iterdir()
-            if d.is_dir() and (d / "views").exists() or (d / "front.png").exists()
+            if d.is_dir() and (
+                (d / "views").exists()
+                or (d / "front.png").exists()
+                or (d / "view_0.png").exists()
+                or (d / "input.png").exists()
+            )
         ]
 
         if len(self.sample_dirs) == 0:
             # Thu quet de qui 1 tang
             self.sample_dirs = [
                 d for d in self.data_root.glob("*/*")
-                if d.is_dir() and ((d / "views").exists() or (d / "front.png").exists())
+                if d.is_dir() and (
+                    (d / "views").exists()
+                    or (d / "front.png").exists()
+                    or (d / "view_0.png").exists()
+                    or (d / "input.png").exists()
+                )
             ]
 
         self.transform = T.Compose([
@@ -279,21 +289,52 @@ class CRMDataset(Dataset):
     def _load_view_image(self, item_dir: Path, view_name: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Doc mot goc nhin: anh RGB, anh CCM, va Mask nhi phan.
+        Ho tro ca ten goc nhin truc giao (front, right...) va chi so so hoa (view_0, view_1...).
         """
-        # Thu muc co the chua truc tiep hoac trong subfolder 'views'
-        img_path = item_dir / f"{view_name}.png"
-        if not img_path.exists():
-            img_path = item_dir / "views" / f"{view_name}.png"
+        view_idx = VIEW_NAMES.index(view_name) if view_name in VIEW_NAMES else None
 
-        ccm_path = item_dir / f"{view_name}_ccm.png"
-        if not ccm_path.exists():
-            ccm_path = item_dir / "views" / f"{view_name}_ccm.png"
+        # Danh sach ung vien anh RGB
+        candidates_img = [item_dir / f"{view_name}.png", item_dir / "views" / f"{view_name}.png"]
+        if view_idx is not None:
+            candidates_img.extend([item_dir / f"view_{view_idx}.png", item_dir / "views" / f"view_{view_idx}.png"])
 
-        mask_path = item_dir / f"{view_name}_mask.png"
-        if not mask_path.exists():
-            mask_path = item_dir / "views" / f"{view_name}_mask.png"
+        img_path = None
+        for p in candidates_img:
+            if p.exists():
+                img_path = p
+                break
 
-        if img_path.exists():
+        # Danh sach ung vien anh CCM
+        candidates_ccm = [item_dir / f"{view_name}_ccm.png", item_dir / "views" / f"{view_name}_ccm.png"]
+        if view_idx is not None:
+            candidates_ccm.extend([
+                item_dir / f"ccm_{view_idx}.png",
+                item_dir / "views" / f"ccm_{view_idx}.png",
+                item_dir / f"ccm_{view_name}.png"
+            ])
+
+        ccm_path = None
+        for p in candidates_ccm:
+            if p.exists():
+                ccm_path = p
+                break
+
+        # Danh sach ung vien anh Mask
+        candidates_mask = [item_dir / f"{view_name}_mask.png", item_dir / "views" / f"{view_name}_mask.png"]
+        if view_idx is not None:
+            candidates_mask.extend([
+                item_dir / f"mask_{view_idx}.png",
+                item_dir / "views" / f"mask_{view_idx}.png",
+                item_dir / f"mask_{view_name}.png"
+            ])
+
+        mask_path = None
+        for p in candidates_mask:
+            if p.exists():
+                mask_path = p
+                break
+
+        if img_path and img_path.exists():
             raw_img = Image.open(img_path).convert("RGBA")
             # Tach mask tu alpha channel hoac file mask rieng
             alpha_np = np.array(raw_img)[:, :, 3] / 255.0
@@ -304,14 +345,14 @@ class CRMDataset(Dataset):
             rgb_pil = Image.new("RGB", (self.image_size, self.image_size), (127, 127, 127))
             mask_np = np.ones((self.image_size, self.image_size), dtype=np.float32)
 
-        if mask_path.exists():
+        if mask_path and mask_path.exists():
             mask_pil = Image.open(mask_path).convert("L")
             mask_np = (np.array(mask_pil) > 127).astype(np.float32)
         else:
             mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8))
 
         # Xu ly CCM (neu khong co file rieng thi tong hop truc tiep tu toa do chuan)
-        if ccm_path.exists():
+        if ccm_path and ccm_path.exists():
             ccm_pil = Image.open(ccm_path).convert("RGB")
             ccm_tensor = self.transform(ccm_pil)
         else:
