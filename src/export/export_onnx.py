@@ -38,7 +38,10 @@ class UNetWrapper(nn.Module):
         self.unet = unet
 
     def forward(self, images: torch.Tensor, ccms: torch.Tensor) -> torch.Tensor:
-        return self.unet(images, ccms)
+        B = images.shape[0]
+        x = torch.cat([images.view(B, 18, *images.shape[3:]),
+                       ccms.view(B, 18, *ccms.shape[3:])], dim=1)
+        return self.unet(x)
 
 def export_crm_to_onnx(
     checkpoint_path: str,
@@ -63,7 +66,7 @@ def export_crm_to_onnx(
     print(f"[1/4] Khoi tao mo hinh CRM tu checkpoint: {checkpoint_path}")
     model = ConvolutionalReconstructionModel(
         triplane_channels=triplane_channels,
-        base_features=64,
+        base_channels=64,
         hidden_dim=64
     )
 

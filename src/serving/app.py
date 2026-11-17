@@ -1,7 +1,8 @@
 """
 FastAPI Microservice for CRM 3D Product Reconstruction
 ======================================================
-Serves REST endpoints for generating GLB/OBJ 3D models from 2D e-commerce photos.
+Serves REST endpoints for generating GLB/OBJ 3D models from 2D e-commerce photos
+with multi-view synthesis and authentic texture projection baking.
 """
 
 import io
@@ -24,7 +25,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(
     title="CRM 3D E-commerce Reconstruction API",
     description="Microservice chuyen doi 1 anh san pham thanh 3D Mesh (GLB/OBJ) phuc vu storefront Next.js",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -56,7 +57,8 @@ def health_check():
         "gpu_available": torch.cuda.is_available(),
         "vram_used_gb": round(vram_used, 2),
         "vram_total_gb": round(vram_total, 2),
-        "model_loaded": engine.model is not None
+        "model_loaded": engine.model is not None,
+        "diffusion_available": engine.synthesizer._stage1_pipeline is not None or torch.cuda.is_available()
     }
 
 @app.post("/generate-3d")
@@ -65,7 +67,9 @@ async def generate_3d_endpoint(
     output_format: str = Form("glb"),
     resolution: int = Form(64),
     target_faces: int = Form(25000),
-    remove_background: bool = Form(True)
+    remove_background: bool = Form(True),
+    use_diffusion: bool = Form(False),
+    bake_texture: bool = Form(True)
 ):
     """
     API endpoint chinh: Sinh 3D Mesh tu 1 anh san pham.
@@ -73,6 +77,9 @@ async def generate_3d_endpoint(
     - output_format: 'glb' (uu tien cho Three.js tren Next.js) hoac 'obj'
     - resolution: do phan giai Marching Cubes (64 cho nhanh, 128 cho chi tiet cao)
     - target_faces: so mat tam giac toi da sau decimation giup load web nhe
+    - remove_background: tu dong tach phong nen va can giua vat the
+    - use_diffusion: bat che do Stage 1 Diffusion (Zero123++) neu co GPU
+    - bake_texture: ban mau sac that tu 6 goc nhin san pham len be mat 3D
     """
     if output_format.lower() not in ["glb", "obj"]:
         raise HTTPException(status_code=400, detail="Chi ho tro dinh dang 'glb' hoac 'obj'")
@@ -82,11 +89,13 @@ async def generate_3d_endpoint(
     try:
         contents = await file.read()
         engine = CRMInferenceEngine.get_instance()
-        mesh, elapsed = engine.generate_mesh(
+        mesh, elapsed, metadata = engine.generate_mesh(
             image_bytes=contents,
             resolution=resolution,
             target_faces=target_faces,
-            remove_background=remove_background
+            remove_background=remove_background,
+            use_diffusion=use_diffusion,
+            bake_texture=bake_texture
         )
 
         filename = f"product_{task_id}.{output_format.lower()}"
@@ -99,7 +108,7 @@ async def generate_3d_endpoint(
             mesh.export(str(file_path), file_type="obj")
             media_type = "text/plain"
 
-        print(f"[Done {task_id}] Sinh 3D thanh cong trong {elapsed:.2f}s | Faces: {len(mesh.faces)}")
+        print(f"[Done {task_id}] Sinh 3D thanh cong trong {elapsed:.2f}s | Faces: {metadata['final_faces']} | Vertices: {metadata['final_vertices']}")
 
         return FileResponse(
             path=str(file_path),
@@ -107,8 +116,10 @@ async def generate_3d_endpoint(
             media_type=media_type,
             headers={
                 "X-Process-Time": f"{elapsed:.2f}s",
-                "X-Vertex-Count": str(len(mesh.vertices)),
-                "X-Face-Count": str(len(mesh.faces))
+                "X-Vertex-Count": str(metadata["final_vertices"]),
+                "X-Face-Count": str(metadata["final_faces"]),
+                "X-Is-Watertight": str(metadata["is_watertight"]),
+                "X-Texture-Baked": str(metadata["texture_baked"])
             }
         )
 
