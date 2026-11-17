@@ -28,40 +28,158 @@ def normalize_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     normalized_mesh.vertices = vertices
     return normalized_mesh
 
+def compute_winding_numbers(points: np.ndarray, triangles: np.ndarray, chunk_size: int = 4096) -> np.ndarray:
+    """
+    Tinh Generalized Winding Number (Jacobson et al., 2013) bang PyTorch/NumPy.
+    Xac dinh chinh xac diem nam ben trong (wn >= 0.5) hay ben ngoai (wn < 0.5)
+    ke ca khi luoi 3D non-watertight hoac co lo thung, khong phu thuoc vao thu vien C rtree.
+    """
+    N = len(points)
+    wn = np.zeros(N, dtype=np.float32)
+    tri = torch.from_numpy(triangles.copy()).float()
+
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        p = torch.from_numpy(points[i:end].copy()).float()
+
+        # Vector tu diem truy van den 3 dinh tam giac
+        a = tri[:, 0].unsqueeze(0) - p.unsqueeze(1)
+        b = tri[:, 1].unsqueeze(0) - p.unsqueeze(1)
+        c = tri[:, 2].unsqueeze(0) - p.unsqueeze(1)
+
+        ra = torch.norm(a, dim=-1)
+        rb = torch.norm(b, dim=-1)
+        rc = torch.norm(c, dim=-1)
+
+        cross_bc = torch.cross(b, c, dim=-1)
+        num = torch.sum(a * cross_bc, dim=-1)
+
+        dot_ab = torch.sum(a * b, dim=-1)
+        dot_bc = torch.sum(b * c, dim=-1)
+        dot_ca = torch.sum(c * a, dim=-1)
+        den = ra * rb * rc + dot_ab * rc + dot_bc * ra + dot_ca * rb
+
+        omega = 2.0 * torch.atan2(num, den)
+        chunk_wn = torch.sum(omega, dim=-1) / (4.0 * np.pi)
+        wn[i:end] = chunk_wn.numpy()
+
+    return wn
+
+
+def sample_mesh_surface_and_colors(mesh: trimesh.Trimesh, num_points: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Lay mau diem tren be mat mesh va trich xuat mau sac UV chan thuc:
+    1. Noi suy UV map (trimesh.visual.color.uv_to_color) tu texture CAD goc
+    2. Fallback sang vertex_colors noi suy qua toa do trong tam barycentric
+    3. Fallback sang face_colors
+    Triet tieu hoan toan loi mau xam mac dinh [0.5, 0.5, 0.5].
+    """
+    surf_pts, face_indices, bary = trimesh.sample.sample_surface(
+        mesh, num_points, return_barycentric=True
+    )
+
+    colors = None
+
+    # 1. Trich xuat mau tu Texture Visuals (UV map va image)
+    if (
+        hasattr(mesh, "visual")
+        and hasattr(mesh.visual, "uv")
+        and mesh.visual.uv is not None
+        and hasattr(mesh.visual, "material")
+        and getattr(mesh.visual.material, "image", None) is not None
+    ):
+        try:
+            tri_uvs = mesh.visual.uv[mesh.faces[face_indices]]
+            interp_uv = np.sum(tri_uvs * bary[:, :, None], axis=1)
+            rgba = trimesh.visual.color.uv_to_color(interp_uv, mesh.visual.material.image)
+            colors = rgba[:, :3].astype(np.float32) / 255.0
+        except Exception:
+            colors = None
+
+    # 2. Trich xuat mau tu vertex_colors
+    if colors is None and hasattr(mesh, "visual") and hasattr(mesh.visual, "vertex_colors") and len(mesh.visual.vertex_colors) > 0:
+        try:
+            tri_colors = mesh.visual.vertex_colors[mesh.faces[face_indices]][:, :, :3].astype(np.float32) / 255.0
+            colors = np.sum(tri_colors * bary[:, :, None], axis=1)
+        except Exception:
+            colors = None
+
+    # 3. Trich xuat mau tu face_colors
+    if colors is None and hasattr(mesh, "visual") and hasattr(mesh.visual, "face_colors") and len(mesh.visual.face_colors) > 0:
+        try:
+            colors = mesh.visual.face_colors[face_indices][:, :3].astype(np.float32) / 255.0
+        except Exception:
+            colors = None
+
+    # 4. Fallback mau sang nhe
+    if colors is None:
+        colors = np.ones((len(surf_pts), 3), dtype=np.float32) * 0.8
+
+    return surf_pts, face_indices, colors
+
+
 def sample_sdf_points_from_mesh(
     mesh: trimesh.Trimesh,
     num_points: int = 16384,
     surface_ratio: float = 0.7,
     noise_std: float = 0.02
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Lay mau diem 3D va tinh SDF (Signed Distance Function) tu mesh:
-    - 70% mau quanh be mat (surface points + Gaussian noise) de hoc chi tiet hinh hoc sac net
-    - 30% mau dong deu trong khong gian hop [-0.5, 0.5]^3 de hoc vung rong ngoai vat the
+    Lay mau diem 3D va tinh Signed Distance Function (SDF) + mau sac:
+    - SDF < 0 cho cac diem ben trong vat the
+    - SDF = 0 cho cac diem tren be mat
+    - SDF > 0 cho cac diem ben ngoai khong gian
+    Su dung cKDTree ket hop Generalized Winding Number (0 dependency rtree).
     """
     n_surface = int(num_points * surface_ratio)
     n_uniform = num_points - n_surface
 
-    # 1. Lay mau tren be mat mesh
-    surf_pts, face_indices = trimesh.sample.sample_surface(mesh, n_surface)
-    noise = np.random.normal(scale=noise_std, size=surf_pts.shape)
+    # 1. Lay mau tren be mat mesh kem mau sac thuc te
+    surf_pts, face_indices, surf_colors = sample_mesh_surface_and_colors(mesh, n_surface)
+    noise = np.random.normal(scale=noise_std, size=surf_pts.shape).astype(np.float32)
     near_surf_pts = surf_pts + noise
+    near_dist = np.linalg.norm(noise, axis=-1, keepdims=True).astype(np.float32)
+
+    # Dau gan be mat theo phap tuyen
+    if hasattr(mesh, "face_normals") and len(mesh.face_normals) > 0:
+        normals = mesh.face_normals[face_indices]
+        near_sign = np.sign(np.sum(noise * normals, axis=-1, keepdims=True))
+        near_sign[near_sign == 0] = 1.0
+        near_sdf = (near_dist * near_sign).astype(np.float32)
+    else:
+        near_sdf = near_dist
+    near_colors = surf_colors.copy()
 
     # 2. Lay mau dong deu trong hop don vi [-0.5, 0.5]^3
-    uniform_pts = np.random.uniform(low=-0.5, high=0.5, size=(n_uniform, 3))
+    uniform_pts = np.random.uniform(low=-0.5, high=0.5, size=(n_uniform, 3)).astype(np.float32)
 
+    # Khoang cach Euclid bang cKDTree
+    tree = cKDTree(surf_pts)
+    vol_dist, vol_idx = tree.query(uniform_pts)
+    vol_colors = surf_colors[vol_idx]
+
+    # Dau am/duong cho volume points qua Generalized Winding Number
+    if len(mesh.faces) > 1500:
+        try:
+            proxy_mesh = mesh.simplify_quadratic_decimation(1500)
+            if len(proxy_mesh.faces) == 0:
+                proxy_mesh = mesh
+        except Exception:
+            proxy_mesh = mesh
+    else:
+        proxy_mesh = mesh
+
+    vol_wn = compute_winding_numbers(uniform_pts, proxy_mesh.triangles)
+    is_inside = vol_wn >= 0.5
+    vol_sign = np.where(is_inside, -1.0, 1.0).astype(np.float32)
+    vol_sdf = (vol_dist * vol_sign)[:, np.newaxis].astype(np.float32)
+
+    # Gop toan bo diem, SDF va mau sac
     all_pts = np.concatenate([near_surf_pts, uniform_pts], axis=0).astype(np.float32)
+    all_sdf = np.concatenate([near_sdf, vol_sdf], axis=0).astype(np.float32)
+    all_colors = np.concatenate([near_colors, vol_colors], axis=0).astype(np.float32)
 
-    # 3. Tinh khoang cach co dau (Signed Distance Function)
-    # Dung Ray-casting va Nearest Point Query cua trimesh
-    proximity_query = trimesh.proximity.ProximityQuery(mesh)
-    distances = proximity_query.signed_distance(all_pts)
-    
-    # SDF trimesh quy uoc: duong la ben trong, am la ben ngoai
-    # Ta dao dau de theo quy uoc chuan Computer Graphics: am la ben trong, duong la ben ngoai
-    sdf_values = -distances.astype(np.float32)[:, np.newaxis]
-
-    return all_pts, sdf_values
+    return all_pts, all_sdf, all_colors
 
 def generate_ccm_from_rgb(rgb_img: Image.Image, mask: np.ndarray, view_name: str) -> np.ndarray:
     """
@@ -207,32 +325,53 @@ class CRMDataset(Dataset):
 
         return rgb_tensor, ccm_tensor, mask_tensor
 
-    def _load_sdf_points(self, item_dir: Path) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _load_sdf_points(self, item_dir: Path) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Nap hoac tao diem lay mau 3D kem gia tri SDF chuan.
+        Nap hoac tao diem lay mau 3D kem gia tri SDF chuan va mau sac thuc te.
         """
+        # 1. Kiem tra dinh dang npy tach roi tu Kaggle data prep
+        points_npy = item_dir / "points.npy"
+        sdf_npy = item_dir / "sdf.npy"
+        colors_npy = item_dir / "colors.npy"
+        if points_npy.exists() and sdf_npy.exists():
+            pts = np.load(points_npy).astype(np.float32)
+            sdfs = np.load(sdf_npy).astype(np.float32)
+            if colors_npy.exists():
+                cols = np.load(colors_npy).astype(np.float32)
+            else:
+                cols = np.ones((len(pts), 3), dtype=np.float32) * 0.8
+
+            if len(pts) >= self.num_points:
+                indices = np.random.choice(len(pts), self.num_points, replace=False)
+                return torch.from_numpy(pts[indices]), torch.from_numpy(sdfs[indices]), torch.from_numpy(cols[indices])
+            return torch.from_numpy(pts), torch.from_numpy(sdfs), torch.from_numpy(cols)
+
+        # 2. Kiem tra file npz tong hop
         npz_path = item_dir / "sdf_samples.npz"
         if npz_path.exists():
             data = np.load(npz_path)
             pts = data["points"].astype(np.float32)
             sdfs = data["sdf"].astype(np.float32)
+            cols = data["colors"].astype(np.float32) if "colors" in data else np.ones((len(pts), 3), dtype=np.float32) * 0.8
             if len(pts) >= self.num_points:
                 indices = np.random.choice(len(pts), self.num_points, replace=False)
-                return torch.from_numpy(pts[indices]), torch.from_numpy(sdfs[indices])
+                return torch.from_numpy(pts[indices]), torch.from_numpy(sdfs[indices]), torch.from_numpy(cols[indices])
+            return torch.from_numpy(pts), torch.from_numpy(sdfs), torch.from_numpy(cols)
 
-        # Neu chua co npz, tim file mesh 3D (.obj / .glb) de tinh online
+        # 3. Neu chua co du lieu diem tien xu ly, tim file mesh 3D de tinh toan online
         mesh_candidates = list(item_dir.glob("*.obj")) + list(item_dir.glob("*.glb"))
         if mesh_candidates:
             mesh = trimesh.load(mesh_candidates[0], force="mesh")
             mesh = normalize_mesh(mesh)
-            pts, sdfs = sample_sdf_points_from_mesh(mesh, num_points=self.num_points)
-            return torch.from_numpy(pts), torch.from_numpy(sdfs)
+            pts, sdfs, cols = sample_sdf_points_from_mesh(mesh, num_points=self.num_points)
+            return torch.from_numpy(pts), torch.from_numpy(sdfs), torch.from_numpy(cols)
 
-        # Fallback mac dinh: lay mau hinh cau don vi r=0.35 lam placeholder
+        # 4. Fallback mac dinh: lay mau hinh cau don vi r=0.35 lam placeholder
         pts = np.random.uniform(-0.5, 0.5, size=(self.num_points, 3)).astype(np.float32)
         radius = np.linalg.norm(pts, axis=-1, keepdims=True)
         sdfs = (radius - 0.35).astype(np.float32)
-        return torch.from_numpy(pts), torch.from_numpy(sdfs)
+        cols = np.ones((self.num_points, 3), dtype=np.float32) * 0.8
+        return torch.from_numpy(pts), torch.from_numpy(sdfs), torch.from_numpy(cols)
 
     def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str]]:
         item_dir = self.sample_dirs[idx]
@@ -249,7 +388,7 @@ class CRMDataset(Dataset):
         ccms_tensor = torch.stack(ccm_list, dim=0)       # [6, 3, H, W]
         masks_tensor = torch.stack(mask_list, dim=0)     # [6, 1, H, W]
 
-        pts_tensor, sdf_tensor = self._load_sdf_points(item_dir)
+        pts_tensor, sdf_tensor, colors_tensor = self._load_sdf_points(item_dir)
 
         return {
             "images": images_tensor,
@@ -257,6 +396,7 @@ class CRMDataset(Dataset):
             "masks": masks_tensor,
             "points": pts_tensor,      # [N, 3]
             "sdf": sdf_tensor,          # [N, 1]
+            "colors": colors_tensor,    # [N, 3]
             "sample_id": item_dir.name
         }
 

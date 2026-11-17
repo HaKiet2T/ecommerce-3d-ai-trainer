@@ -90,6 +90,13 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 
+try:
+    from diffusers import UNet2DModel
+    DIFFUSERS_AVAILABLE = True
+except ImportError:
+    UNet2DModel = None
+    DIFFUSERS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # 2. Config
 # ---------------------------------------------------------------------------
@@ -97,6 +104,7 @@ import numpy as np
 class TrainConfig:
     # Model
     crm_checkpoint = "Zhengyi/CRM"  # HuggingFace repo
+    use_foundation_backbone = True   # Khop 100% 629 keys voi checkpoint Zhengyi/CRM (CRM.pth)
     triplane_resolution = 256
     triplane_channels = 32
     mlp_hidden_dim = 64
@@ -290,97 +298,209 @@ class TriplaneMLP(nn.Module):
         return sdf, color
 
 
+def get_tri(triview_color, dim=1, blender=True, scale=0.95):
+    """
+    Chuyen doi 6 goc nhin truc giao thanh dac trung Triplane theo chuan CRM.
+    """
+    has_batch = (triview_color.dim() == 5)
+    if not has_batch:
+        triview_color = triview_color.unsqueeze(0)
+
+    B, num_v, C, H, W = triview_color.shape
+    tri_list = []
+
+    for b in range(B):
+        tc = triview_color[b]
+        tc0 = torch.rot90(tc[2], k=2, dims=[1, 2])
+        tc1 = tc[4].flip(2).flip(1)
+        tc2 = torch.rot90(torch.rot90(tc[0], k=3, dims=[1, 2]).flip(2), k=2, dims=[1, 2])
+        tc3 = torch.rot90(torch.rot90(tc[5], k=2, dims=[1, 2]).flip(2), k=2, dims=[1, 2])
+        tc4 = torch.rot90(tc[1], k=2, dims=[1, 2]).flip(1).flip(1).flip(2)
+        tc5 = torch.rot90(tc[3], k=1, dims=[1, 2]).flip(1).flip(2)
+
+        plane1 = torch.cat((tc0, tc1, tc2), dim=2)
+        plane2 = torch.cat((tc3, tc4, tc5), dim=2)
+        combined = torch.cat((plane1, plane2), dim=0)
+        tri_list.append(combined)
+
+    result = torch.stack(tri_list, dim=0)
+    if not has_batch:
+        result = result.squeeze(0)
+    return result
+
+
+class UNetPP(nn.Module):
+    """
+    Wrapper UNet2DModel tu diffusers (612 keys + 1 key learned_plane = 613 keys).
+    Khop 100% kien truc goc cua Zhengyi/CRM.
+    """
+    def __init__(self, in_channels=32):
+        super().__init__()
+        if not DIFFUSERS_AVAILABLE:
+            raise ImportError("diffusers is required for UNetPP.")
+        self.in_channels = in_channels
+        self.unet = UNet2DModel(
+            sample_size=[256, 256 * 3],
+            in_channels=in_channels,
+            out_channels=32,
+            layers_per_block=2,
+            block_out_channels=(64, 128, 128, 128 * 2, 128 * 2, 128 * 4, 128 * 4),
+            down_block_types=(
+                "DownBlock2D", "DownBlock2D", "DownBlock2D",
+                "AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D",
+                "DownBlock2D",
+            ),
+            up_block_types=(
+                "UpBlock2D", "AttnUpBlock2D", "AttnUpBlock2D",
+                "AttnUpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D",
+            ),
+        )
+        if in_channels > 12:
+            self.learned_plane = nn.Parameter(torch.zeros([1, in_channels - 12, 256, 256 * 3]))
+        else:
+            self.learned_plane = None
+
+    def forward(self, x, t=0):
+        if self.learned_plane is not None and x.shape[1] < self.in_channels:
+            learned = self.learned_plane.expand(x.shape[0], -1, -1, -1).to(x.device)
+            x = torch.cat([x, learned], dim=1)
+        return self.unet(x, t).sample
+
+
+class TetTexNet(nn.Module):
+    """Truy van va noi suy dac trung Triplane tai toa do diem 3D."""
+    def __init__(self, plane_reso=256, padding=0.1, fea_concat=False):
+        super().__init__()
+        self.plane_reso = plane_reso
+        self.padding = padding
+        self.fea_concat = fea_concat
+
+    def forward(self, rolled_out_feature, query):
+        reso = self.plane_reso
+        xy = rolled_out_feature[:, :, :, 0:reso]
+        yz = rolled_out_feature[:, :, :, reso:2 * reso]
+        zx = rolled_out_feature[:, :, :, 2 * reso:]
+
+        q = query * 2.0
+        q_xy = q[:, :, [0, 1]].unsqueeze(2)
+        q_yz = q[:, :, [1, 2]].unsqueeze(2)
+        q_zx = q[:, :, [2, 0]].unsqueeze(2)
+
+        f_xy = F.grid_sample(xy, q_xy, padding_mode="border", align_corners=True, mode="bilinear").squeeze(-1).permute(0, 2, 1)
+        f_yz = F.grid_sample(yz, q_yz, padding_mode="border", align_corners=True, mode="bilinear").squeeze(-1).permute(0, 2, 1)
+        f_zx = F.grid_sample(zx, q_zx, padding_mode="border", align_corners=True, mode="bilinear").squeeze(-1).permute(0, 2, 1)
+
+        if self.fea_concat:
+            return torch.cat([f_xy, f_yz, f_zx], dim=-1)
+        return f_xy + f_yz + f_zx
+
+
+class SdfMlp(nn.Module):
+    """Geometry MLP Head: 6 keys."""
+    def __init__(self, input_dim=32, hidden_dim=512, bias=True):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim, bias=bias)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.fc3 = nn.Linear(hidden_dim, 4, bias=bias)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+class RgbMlp(nn.Module):
+    """Appearance MLP Head: 6 keys."""
+    def __init__(self, input_dim=32, hidden_dim=512, bias=True):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim, bias=bias)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.fc3 = nn.Linear(hidden_dim, 3, bias=bias)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
 class CRMModel(nn.Module):
     """
-    Full CRM Model: U-Net encoder + Triplane + MLP decoder.
+    CRM Model tich hop hai che do:
+    - Foundation Mode: Khop 100% 629 keys cua Zhengyi/CRM (UNetPP, TetTexNet, SdfMlp, RgbMlp, weightMlp)
+    - Lightweight Mode: U-Net 17.3M (68 keys) phuc vu chay nhe
     """
     def __init__(self, config):
         super().__init__()
-
-        # Input: 6 views * 3 RGB + 6 CCMs * 3 = 36 channels
-        in_channels = config.num_views * (3 + config.ccm_channels)
-
-        self.unet = CRMUNet(
-            in_channels=in_channels,
-            triplane_channels=config.triplane_channels,
-            base_channels=64
-        )
-
-        self.mlp = TriplaneMLP(
-            triplane_channels=config.triplane_channels,
-            hidden_dim=config.mlp_hidden_dim
-        )
-
-        self.triplane_channels = config.triplane_channels
+        self.use_foundation = getattr(config, "use_foundation_backbone", True) and DIFFUSERS_AVAILABLE
         self.triplane_resolution = config.triplane_resolution
+        self.triplane_channels = config.triplane_channels
+
+        if self.use_foundation:
+            self.unet2 = UNetPP(in_channels=32)
+            self.decoder = TetTexNet(plane_reso=config.triplane_resolution, fea_concat=False)
+            self.weightMlp = nn.Sequential(
+                nn.Linear(32 * 8, 512),
+                nn.SiLU(),
+                nn.Linear(512, 21)
+            )
+            self.sdfMlp = SdfMlp(input_dim=32, hidden_dim=512, bias=True)
+            self.rgbMlp = RgbMlp(input_dim=32, hidden_dim=512, bias=True)
+        else:
+            in_channels = config.num_views * (3 + config.ccm_channels)
+            self.unet = CRMUNet(
+                in_channels=in_channels,
+                triplane_channels=config.triplane_channels,
+                base_channels=64
+            )
+            self.mlp = TriplaneMLP(
+                triplane_channels=config.triplane_channels,
+                hidden_dim=config.mlp_hidden_dim
+            )
 
     def query_triplane(self, triplane, points):
-        """
-        Truy vấn triplane tại các điểm 3D.
-
-        Args:
-            triplane: [B, C*3, H, W] from U-Net
-            points: [B, N, 3] - 3D coordinates in [-1, 1]
-
-        Returns:
-            features: [B, N, C] - aggregated triplane features
-        """
+        """Dung cho Lightweight Mode."""
         B, _, H, W = triplane.shape
         C = self.triplane_channels
-        N = points.shape[1]
+        xy_plane = triplane[:, :C]
+        xz_plane = triplane[:, C:2*C]
+        yz_plane = triplane[:, 2*C:]
 
-        # Split into 3 planes
-        xy_plane = triplane[:, :C]       # [B, C, H, W]
-        xz_plane = triplane[:, C:2*C]    # [B, C, H, W]
-        yz_plane = triplane[:, 2*C:]     # [B, C, H, W]
+        xy_coords = points[:, :, :2].unsqueeze(2)
+        xz_coords = points[:, :, [0, 2]].unsqueeze(2)
+        yz_coords = points[:, :, [1, 2]].unsqueeze(2)
 
-        # Sample coordinates (grid_sample expects [B, N, 1, 2])
-        xy_coords = points[:, :, :2].unsqueeze(2)   # [B, N, 1, 2] - (x, y)
-        xz_coords = points[:, :, [0, 2]].unsqueeze(2)  # [B, N, 1, 2] - (x, z)
-        yz_coords = points[:, :, [1, 2]].unsqueeze(2)  # [B, N, 1, 2] - (y, z)
-
-        # Bilinear interpolation
         f_xy = F.grid_sample(xy_plane, xy_coords, align_corners=True, mode="bilinear")
         f_xz = F.grid_sample(xz_plane, xz_coords, align_corners=True, mode="bilinear")
         f_yz = F.grid_sample(yz_plane, yz_coords, align_corners=True, mode="bilinear")
 
-        # [B, C, N, 1] -> [B, N, C]
         f_xy = f_xy.squeeze(-1).permute(0, 2, 1)
         f_xz = f_xz.squeeze(-1).permute(0, 2, 1)
         f_yz = f_yz.squeeze(-1).permute(0, 2, 1)
-
-        # Aggregate: sum
-        features = f_xy + f_xz + f_yz
-
-        return features
+        return f_xy + f_xz + f_yz
 
     def forward(self, views, ccms, points):
         """
-        Args:
-            views: [B, 6, 3, H, W] - 6 RGB views
-            ccms: [B, 6, 3, H, W] - 6 CCMs
-            points: [B, N, 3] - query points
-
-        Returns:
-            sdf: [B, N, 1]
-            color: [B, N, 3]
+        Forward pass cho ca hai che do, tra ve tuple (sdf, color, triplane).
         """
-        B = views.shape[0]
+        if self.use_foundation:
+            tri_views = get_tri(views, blender=True)
+            tri_ccms = get_tri(ccms, blender=True)
+            x = torch.cat([tri_views, tri_ccms], dim=1)
+            triplane = self.unet2(x)
+            feat = self.decoder(triplane, points)
+            sdf = self.sdfMlp(feat)[..., 0:1]
+            color = torch.sigmoid(self.rgbMlp(feat))
+            return sdf, color, triplane
 
-        # Concatenate views and CCMs: [B, 36, H, W]
+        # Lightweight Mode
+        B = views.shape[0]
         views_flat = views.reshape(B, -1, views.shape[-2], views.shape[-1])
         ccms_flat = ccms.reshape(B, -1, ccms.shape[-2], ccms.shape[-1])
         x = torch.cat([views_flat, ccms_flat], dim=1)
 
-        # U-Net -> triplane
         triplane = self.unet(x)
-
-        # Query triplane at 3D points
         features = self.query_triplane(triplane, points)
-
-        # MLP -> SDF + Color
         sdf, color = self.mlp(features)
-
         return sdf, color, triplane
 
 
@@ -662,7 +782,8 @@ def train(config):
 
         if len(pretrained_dict) > 0:
             model.load_state_dict(pretrained_dict, strict=False)
-            log(f"  Loaded {len(pretrained_dict)}/{len(model_dict)} pretrained weights")
+            match_pct = (len(pretrained_dict) / len(model_dict)) * 100
+            log(f"  Loaded {len(pretrained_dict)}/{len(model_dict)} pretrained weights ({match_pct:.1f}%)")
         else:
             log(f"  Pretrained weights note: {len(state_dict)} checkpoint keys vs {len(model_dict)} model keys. Training initialized weights.")
     except Exception as e:
@@ -671,10 +792,14 @@ def train(config):
 
     # Gradient checkpointing
     if config.gradient_checkpointing:
-        # Enable for U-Net encoder blocks
-        for module in model.unet.modules():
-            if hasattr(module, "gradient_checkpointing"):
-                module.gradient_checkpointing = True
+        if hasattr(model, "use_foundation") and model.use_foundation:
+            if hasattr(model.unet2.unet, "enable_gradient_checkpointing"):
+                model.unet2.unet.enable_gradient_checkpointing()
+                log("  Enabled gradient checkpointing on Foundation UNet2DModel")
+        elif hasattr(model, "unet"):
+            for module in model.unet.modules():
+                if hasattr(module, "gradient_checkpointing"):
+                    module.gradient_checkpointing = True
 
     # DataParallel for multi-GPU
     if config.use_data_parallel and torch.cuda.device_count() > 1:

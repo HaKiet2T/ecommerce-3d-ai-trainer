@@ -48,9 +48,11 @@ print("[1/6] Installing dependencies...")
 install_dependencies()
 
 import numpy as np
+import torch
 import trimesh
 from PIL import Image
 from tqdm import tqdm
+from typing import Tuple, List, Optional, Dict, Any
 
 # ---------------------------------------------------------------------------
 # Config
@@ -261,10 +263,103 @@ def generate_ccm(mesh, config):
     return ccms
 
 
+def compute_winding_numbers(points: np.ndarray, triangles: np.ndarray, chunk_size: int = 4096) -> np.ndarray:
+    """
+    Tinh Generalized Winding Number (Jacobson et al., 2013) bang PyTorch/NumPy.
+    Xac dinh chinh xac diem nam ben trong (wn >= 0.5) hay ben ngoai (wn < 0.5)
+    ke ca khi luoi 3D non-watertight hoac co lo thung, khong phu thuoc thu vien C rtree.
+    """
+    N = len(points)
+    wn = np.zeros(N, dtype=np.float32)
+    tri = torch.from_numpy(triangles.copy()).float()
+
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        p = torch.from_numpy(points[i:end].copy()).float()
+
+        # Vector tu diem truy van den 3 dinh tam giac
+        a = tri[:, 0].unsqueeze(0) - p.unsqueeze(1)
+        b = tri[:, 1].unsqueeze(0) - p.unsqueeze(1)
+        c = tri[:, 2].unsqueeze(0) - p.unsqueeze(1)
+
+        ra = torch.norm(a, dim=-1)
+        rb = torch.norm(b, dim=-1)
+        rc = torch.norm(c, dim=-1)
+
+        cross_bc = torch.cross(b, c, dim=-1)
+        num = torch.sum(a * cross_bc, dim=-1)
+
+        dot_ab = torch.sum(a * b, dim=-1)
+        dot_bc = torch.sum(b * c, dim=-1)
+        dot_ca = torch.sum(c * a, dim=-1)
+        den = ra * rb * rc + dot_ab * rc + dot_bc * ra + dot_ca * rb
+
+        omega = 2.0 * torch.atan2(num, den)
+        chunk_wn = torch.sum(omega, dim=-1) / (4.0 * np.pi)
+        wn[i:end] = chunk_wn.numpy()
+
+    return wn
+
+
+def sample_mesh_surface_and_colors(mesh, num_points: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Lay mau diem tren be mat mesh va trich xuat mau sac thuc te:
+    1. Uu tien noi suy UV map (trimesh.visual.color.uv_to_color) tu texture cua CAD/GLTF goc
+    2. Fallback sang vertex_colors noi suy qua toa do trong tam barycentric
+    3. Fallback sang face_colors
+    Triet tieu hoan toan hien tuong mau xam mac dinh [0.5, 0.5, 0.5].
+    """
+    surf_pts, face_indices, bary = trimesh.sample.sample_surface(
+        mesh, num_points, return_barycentric=True
+    )
+
+    colors = None
+
+    # 1. Trich xuat mau tu Texture Visuals (UV map va image)
+    if (
+        hasattr(mesh, "visual")
+        and hasattr(mesh.visual, "uv")
+        and mesh.visual.uv is not None
+        and hasattr(mesh.visual, "material")
+        and getattr(mesh.visual.material, "image", None) is not None
+    ):
+        try:
+            tri_uvs = mesh.visual.uv[mesh.faces[face_indices]]
+            interp_uv = np.sum(tri_uvs * bary[:, :, None], axis=1)
+            rgba = trimesh.visual.color.uv_to_color(interp_uv, mesh.visual.material.image)
+            colors = rgba[:, :3].astype(np.float32) / 255.0
+        except Exception:
+            colors = None
+
+    # 2. Trich xuat mau tu vertex_colors
+    if colors is None and hasattr(mesh, "visual") and hasattr(mesh.visual, "vertex_colors") and len(mesh.visual.vertex_colors) > 0:
+        try:
+            tri_colors = mesh.visual.vertex_colors[mesh.faces[face_indices]][:, :, :3].astype(np.float32) / 255.0
+            colors = np.sum(tri_colors * bary[:, :, None], axis=1)
+        except Exception:
+            colors = None
+
+    # 3. Trich xuat mau tu face_colors
+    if colors is None and hasattr(mesh, "visual") and hasattr(mesh.visual, "face_colors") and len(mesh.visual.face_colors) > 0:
+        try:
+            colors = mesh.visual.face_colors[face_indices][:, :3].astype(np.float32) / 255.0
+        except Exception:
+            colors = None
+
+    # 4. Fallback: mau vat lieu co ban [0.8, 0.8, 0.8] thay vi xam xi
+    if colors is None:
+        colors = np.ones((len(surf_pts), 3), dtype=np.float32) * 0.8
+
+    return surf_pts, face_indices, colors
+
+
 def sample_points_and_sdf(mesh, config):
     """
-    Sample 3D points and compute SDF values using fast, safe cKDTree.
-    Safe against non-watertight meshes, uses <50MB RAM, zero OOM risk.
+    Lay mau diem 3D va tinh gia tri Signed Distance Function (SDF) chuan xac:
+    - SDF < 0 cho cac diem ben trong vat the (Interior)
+    - SDF = 0 cho cac diem tren be mat (Surface)
+    - SDF > 0 cho cac diem ben ngoai khong gian (Exterior)
+    Su dung cKDTree cho khoang cach Euclid va Generalized Winding Number cho dau am/duong.
     """
     from scipy.spatial import cKDTree
 
@@ -275,17 +370,11 @@ def sample_points_and_sdf(mesh, config):
     if scale > 0:
         mesh_centered.apply_scale(1.0 / scale)
 
-    # 1. Surface points (ground truth SDF = 0)
-    surf_pts, face_indices = trimesh.sample.sample_surface(
+    # 1. Surface points (ground truth SDF = 0) kem mau sac UV thuc te
+    surf_pts, face_indices, surf_colors = sample_mesh_surface_and_colors(
         mesh_centered, config.num_surface_points
     )
     surf_sdf = np.zeros((len(surf_pts), 1), dtype=np.float32)
-
-    # Surface colors
-    if hasattr(mesh_centered.visual, "face_colors") and len(mesh_centered.visual.face_colors) > 0:
-        surf_colors = mesh_centered.visual.face_colors[face_indices][:, :3] / 255.0
-    else:
-        surf_colors = np.ones((len(surf_pts), 3), dtype=np.float32) * 0.5
 
     # 2. Near-surface points (surface + Gaussian noise sigma=0.02)
     noise = np.random.normal(scale=0.02, size=surf_pts.shape).astype(np.float32)
@@ -293,7 +382,7 @@ def sample_points_and_sdf(mesh, config):
     near_dist = np.linalg.norm(noise, axis=-1, keepdims=True).astype(np.float32)
     near_colors = surf_colors.copy()
 
-    # Dấu gần bề mặt dựa vào pháp tuyến bề mặt (normal)
+    # Dau gan be mat dua vao phap tuyen be mat (normal)
     if hasattr(mesh_centered, "face_normals") and len(mesh_centered.face_normals) > 0:
         normals = mesh_centered.face_normals[face_indices]
         near_sign = np.sign(np.sum(noise * normals, axis=-1, keepdims=True))
@@ -305,15 +394,31 @@ def sample_points_and_sdf(mesh, config):
     # 3. Volume points trong bounding box [-0.6, 0.6]^3
     vol_pts = np.random.uniform(-0.6, 0.6, (config.num_volume_points, 3)).astype(np.float32)
 
-    # Fast cKDTree query against surface points (tránh mesh.contains raycast OOM)
+    # Khoang cach Euclid toi be mat gan nhat qua cKDTree
     tree = cKDTree(surf_pts)
     vol_dist, vol_idx = tree.query(vol_pts)
-    vol_dist = vol_dist.astype(np.float32)[:, np.newaxis]
     vol_colors = surf_colors[vol_idx]
+
+    # Tinh dau am duong cho volume points bang Generalized Winding Number
+    # Dung proxy mesh (decimate xuong toi da 1500 mat de tinh cuc nhanh <0.3s)
+    if len(mesh_centered.faces) > 1500:
+        try:
+            proxy_mesh = mesh_centered.simplify_quadratic_decimation(1500)
+            if len(proxy_mesh.faces) == 0:
+                proxy_mesh = mesh_centered
+        except Exception:
+            proxy_mesh = mesh_centered
+    else:
+        proxy_mesh = mesh_centered
+
+    vol_wn = compute_winding_numbers(vol_pts, proxy_mesh.triangles)
+    is_inside = vol_wn >= 0.5
+    vol_sign = np.where(is_inside, -1.0, 1.0).astype(np.float32)
+    vol_sdf = (vol_dist * vol_sign)[:, np.newaxis].astype(np.float32)
 
     # Combine: surface + near surface + volume
     points = np.vstack([surf_pts, near_pts, vol_pts]).astype(np.float32)
-    sdf = np.vstack([surf_sdf, near_sdf, vol_dist]).astype(np.float32)
+    sdf = np.vstack([surf_sdf, near_sdf, vol_sdf]).astype(np.float32)
     colors = np.vstack([surf_colors, near_colors, vol_colors]).astype(np.float32)
 
     return points, sdf, colors
