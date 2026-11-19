@@ -38,7 +38,14 @@ except ImportError:
     rembg = None
 
 from src.data.dataset import generate_ccm_from_rgb, VIEW_NAMES
-from src.models.crm import CRMModel, ConvolutionalReconstructionModel
+from src.models.crm import (
+    CRMModel,
+    ConvolutionalReconstructionModel,
+    build_crm_model,
+    CRMFoundationModel,
+    CRMLightweightModel,
+    DIFFUSERS_AVAILABLE
+)
 
 # Camera directional vectors corresponding to VIEW_NAMES:
 # ["front", "right", "back", "left", "top", "bottom"]
@@ -363,7 +370,15 @@ class CRMInferenceEngine:
         self.device = torch.device(
             device_name if device_name else ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        self.checkpoint_path = checkpoint_path or os.environ.get("CRM_CHECKPOINT", "checkpoints/crm_best.pt")
+        if checkpoint_path:
+            self.checkpoint_path = checkpoint_path
+        elif os.environ.get("CRM_CHECKPOINT"):
+            self.checkpoint_path = os.environ.get("CRM_CHECKPOINT")
+        elif os.path.exists("checkpoints/crm_stage2_foundation_best.pth"):
+            self.checkpoint_path = "checkpoints/crm_stage2_foundation_best.pth"
+        else:
+            self.checkpoint_path = "checkpoints/crm_best.pt"
+
         self.model = self._load_model()
         self.synthesizer = MultiViewSynthesizer(
             lora_weights_path="checkpoints/stage1_lora",
@@ -380,21 +395,40 @@ class CRMInferenceEngine:
             cls._instance = cls(checkpoint_path=checkpoint_path, enable_diffusion=enable_diffusion)
         return cls._instance
 
-    def _load_model(self) -> CRMModel:
+    def _load_model(self) -> torch.nn.Module:
         print(f"[Serving] Dang khoi tao mo hinh CRM tren thiet bi: {self.device}...")
-        model = CRMModel(
-            triplane_resolution=256,
-            triplane_channels=32,
-            base_channels=64,
-            hidden_dim=64
-        ).to(self.device)
 
+        target_arch = "auto"
+        state_dict = None
         if os.path.exists(self.checkpoint_path):
             print(f"[Serving] Nap trong so CRM tu: {self.checkpoint_path}")
             ckpt = torch.load(self.checkpoint_path, map_location=self.device)
-            state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-            model.load_state_dict(state_dict)
-            print("[Serving] Mo hinh CRM da san sang phuc vu!")
+            state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt.get("model", ckpt))) if isinstance(ckpt, dict) else ckpt
+
+            if isinstance(state_dict, dict):
+                has_unet = any("unet." in k for k in state_dict.keys())
+                if has_unet and DIFFUSERS_AVAILABLE:
+                    target_arch = "foundation"
+                elif not has_unet:
+                    target_arch = "lightweight"
+
+        model = build_crm_model(arch_type=target_arch).to(self.device)
+
+        if state_dict is not None and isinstance(state_dict, dict):
+            model_dict = model.state_dict()
+            cleaned_dict = {}
+            for k, v in state_dict.items():
+                clean_k = k
+                for pfx in ["module.", "crm.", "model."]:
+                    if clean_k.startswith(pfx):
+                        clean_k = clean_k[len(pfx):]
+                if clean_k in model_dict and v.shape == model_dict[clean_k].shape:
+                    cleaned_dict[clean_k] = v
+
+            matched_count = len(cleaned_dict)
+            model.load_state_dict(cleaned_dict, strict=False)
+            pct = (matched_count / len(model_dict)) * 100 if len(model_dict) > 0 else 0
+            print(f"[Serving] Nap thanh cong {matched_count}/{len(model_dict)} keys ({pct:.1f}%) cho kien truc {target_arch}!")
         else:
             print(f"[Serving] Canh bao: Khong tim thay '{self.checkpoint_path}'. Chay o che do weights khoi tao.")
 
